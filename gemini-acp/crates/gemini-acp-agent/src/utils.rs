@@ -1,32 +1,32 @@
 //! Small, dependency-light primitives inspired by `claude-agent-acp/src/utils.ts`.
 //!
 //! The original implementation bridges push-based producers and async
-//! iterators. In Rust, `Pushable<T>` provides the same semantics without
-//! spawning a worker thread or allocating an intermediate task queue.
+//! iterators. In Rust, `Pushable<T>` provides the same semantics using Tokio's
+//! synchronization primitives, without a worker task or an intermediate
+//! channel allocation per consumer.
 
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::{sleep as tokio_sleep, Duration};
 
 struct State<T> {
     queue: VecDeque<T>,
-    wakers: Vec<Waker>,
     closed: bool,
 }
 
-/// A push-based asynchronous stream.
+/// A push-based asynchronous queue with explicit close semantics.
 ///
-/// `push()` is non-blocking and wakes exactly the consumers that may be
-/// waiting. `close()` is idempotent and causes all pending/future polls to
-/// terminate once the buffered values have been drained.
+/// `push()` is safe to call from a producer task while one or more consumers
+/// wait in `next()`. Values are FIFO. Closing drains buffered values before
+/// returning `None`.
 #[derive(Clone)]
 pub struct Pushable<T> {
     state: Arc<Mutex<State<T>>>,
+    notify: Arc<Notify>,
 }
 
 impl<T> Default for Pushable<T> {
@@ -40,9 +40,9 @@ impl<T> Pushable<T> {
         Self {
             state: Arc::new(Mutex::new(State {
                 queue: VecDeque::new(),
-                wakers: Vec::new(),
                 closed: false,
             })),
+            notify: Arc::new(Notify::new()),
         }
     }
 
@@ -53,60 +53,40 @@ impl<T> Pushable<T> {
             return false;
         }
         state.queue.push_back(item);
-        let wakers = std::mem::take(&mut state.wakers);
         drop(state);
-        for waker in wakers {
-            waker.wake();
-        }
+        self.notify.notify_waiters();
         true
     }
 
-    /// Close the stream. Buffered items remain observable before `None`.
+    /// Close the queue. Existing buffered values remain available.
     pub async fn close(&self) {
         let mut state = self.state.lock().await;
-        state.closed = true;
-        let wakers = std::mem::take(&mut state.wakers);
-        drop(state);
-        for waker in wakers {
-            waker.wake();
+        if !state.closed {
+            state.closed = true;
         }
+        drop(state);
+        self.notify.notify_waiters();
     }
 
     pub async fn is_closed(&self) -> bool {
         self.state.lock().await.closed
     }
 
-    pub fn stream(&self) -> PushableStream<T> {
-        PushableStream {
-            state: Arc::clone(&self.state),
+    /// Receive the next value, or `None` after the queue is closed and drained.
+    pub async fn next(&self) -> Option<T> {
+        loop {
+            let notified = self.notify.notified();
+            {
+                let mut state = self.state.lock().await;
+                if let Some(item) = state.queue.pop_front() {
+                    return Some(item);
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            notified.await;
         }
-    }
-}
-
-/// Consumer side of [`Pushable`].
-pub struct PushableStream<T> {
-    state: Arc<Mutex<State<T>>>,
-}
-
-impl<T: Unpin> futures_core::Stream for PushableStream<T> {
-    type Item = T;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let state = self.state.clone();
-        let mut lock = match state.try_lock() {
-            Ok(lock) => lock,
-            Err(_) => return Poll::Pending,
-        };
-
-        if let Some(item) = lock.queue.pop_front() {
-            return Poll::Ready(Some(item));
-        }
-        if lock.closed {
-            return Poll::Ready(None);
-        }
-
-        lock.wakers.push(cx.waker().clone());
-        Poll::Pending
     }
 }
 
@@ -122,7 +102,6 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::StreamExt;
 
     #[tokio::test]
     async fn pushable_preserves_order_and_closes_cleanly() {
@@ -131,10 +110,9 @@ mod tests {
         queue.push(2).await;
         queue.close().await;
 
-        let mut stream = queue.stream();
-        assert_eq!(stream.next().await, Some(1));
-        assert_eq!(stream.next().await, Some(2));
-        assert_eq!(stream.next().await, None);
+        assert_eq!(queue.next().await, Some(1));
+        assert_eq!(queue.next().await, Some(2));
+        assert_eq!(queue.next().await, None);
     }
 
     #[tokio::test]
@@ -142,5 +120,19 @@ mod tests {
         let queue = Pushable::<u8>::new();
         queue.close().await;
         assert!(!queue.push(1).await);
+    }
+
+    #[tokio::test]
+    async fn consumer_waits_until_producer_pushes() {
+        let queue = Pushable::new();
+        let producer = queue.clone();
+
+        let task = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            producer.push("ready").await
+        });
+
+        assert_eq!(queue.next().await, Some("ready"));
+        assert!(task.await.unwrap());
     }
 }
