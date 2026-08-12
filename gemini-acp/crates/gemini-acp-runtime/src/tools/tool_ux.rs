@@ -1,13 +1,8 @@
 //! Claude-style ACP tool UX mapping for Gemini tools.
 //!
-//! The module keeps tool-call presentation and tool-result presentation separate.
-//! The UI target is deliberately quiet and high-signal:
-//! - compact, human-readable titles;
-//! - project-relative paths for display;
-//! - ACP locations with source lines for follow-along;
-//! - diffs for writes/edits;
-//! - terminal blocks for shell execution;
-//! - normalized search results instead of leaking absolute workspace paths.
+//! Presentation is intentionally quiet and high-signal:
+//! compact titles, relative paths, source locations, diffs, and terminal cards.
+//! Tool results are normalized so absolute workspace paths do not dominate the UI.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -88,8 +83,7 @@ pub fn result_update(
         "shell_exec" => shell_result(result, is_ok, terminal_id),
         "file_write" | "file_edit" | "replace_in_file" => ResultUpdate {
             status: if is_ok { ToolCallStatus::Completed } else { ToolCallStatus::Failed },
-            // Successful edits are already represented by the initial ACP Diff.
-            // Repeating the whole file here makes the UI noisy.
+            // A successful edit is already represented by the initial Diff card.
             content: if is_ok { vec![] } else { text_content(result, true) },
             locations: file_location(args, cwd),
         },
@@ -119,11 +113,16 @@ pub fn result_update(
 
 fn file_read(args: &serde_json::Value, cwd: &Path) -> ToolInfo {
     let path = arg_str(args, "path").unwrap_or("File");
-    let display = display_path(path, cwd);
     let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1).max(1);
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(500).max(1);
+
     ToolInfo {
-        title: format!("Read {display} ({}-{})", offset, offset + limit - 1),
+        title: format!(
+            "Read {} ({}-{})",
+            display_path(path, cwd),
+            offset,
+            offset + limit - 1
+        ),
         kind: agent_client_protocol::schema::v1::ToolKind::Read,
         content: vec![],
         locations: vec![ToolCallLocation::new(resolve_path(path, cwd)).line(offset as u32)],
@@ -245,8 +244,7 @@ fn shell_exec(args: &serde_json::Value, terminal_id: Option<&str>) -> ToolInfo {
         .unwrap_or_default();
 
     ToolInfo {
-        // The command itself is the most useful shell title. Avoid adding a
-        // generic "Exec:" prefix so clients can display it as a terminal card.
+        // The command is the title, matching the compact terminal-card pattern.
         title: if command.is_empty() {
             "Terminal".into()
         } else {
@@ -314,6 +312,7 @@ fn search_location(args: &serde_json::Value, cwd: &Path) -> Vec<ToolCallLocation
     vec![ToolCallLocation::new(resolve_path(path, cwd))]
 }
 
+/// Convert `path:line:text` and `## path:line` displays to compact project-relative forms.
 fn normalize_search_result(tool_name: &str, result: &str, cwd: &Path) -> String {
     let mut output = String::with_capacity(result.len());
 
@@ -322,12 +321,11 @@ fn normalize_search_result(tool_name: &str, result: &str, cwd: &Path) -> String 
             output.push('\n');
         }
 
-        let normalized = if tool_name == "search_and_read" && line.starts_with("## ") {
-            normalize_heading_path(line, cwd)
+        if tool_name == "search_and_read" && line.starts_with("## ") {
+            output.push_str(&normalize_heading_path(line, cwd));
         } else {
-            normalize_match_line(line, cwd)
-        };
-        output.push_str(&normalized);
+            output.push_str(&normalize_match_line(line, cwd));
+        }
     }
 
     if result.ends_with('\n') {
@@ -339,14 +337,19 @@ fn normalize_search_result(tool_name: &str, result: &str, cwd: &Path) -> String 
 
 fn normalize_heading_path(line: &str, cwd: &Path) -> String {
     let body = &line[3..];
-    let Some((path, suffix)) = split_path_line(body) else {
+    let Some((path, line_number, tail)) = split_path_line(body) else {
         return line.to_owned();
     };
-    format!("## {}{}", display_path(path, cwd), suffix)
+    format!(
+        "## {}:{}{}",
+        display_path(path, cwd),
+        line_number,
+        tail
+    )
 }
 
 fn normalize_match_line(line: &str, cwd: &Path) -> String {
-    let Some((path, suffix)) = split_path_line(line) else {
+    let Some((path, line_number, tail)) = split_path_line(line) else {
         return line.to_owned();
     };
 
@@ -354,27 +357,31 @@ fn normalize_match_line(line: &str, cwd: &Path) -> String {
         return line.to_owned();
     }
 
-    format!("{}{}", display_path(path, cwd), suffix)
+    format!(
+        "{}:{}{}",
+        display_path(path, cwd),
+        line_number,
+        tail
+    )
 }
 
-/// Splits `path:line:rest` and preserves the `:line:rest` suffix.
-fn split_path_line(line: &str) -> Option<(&str, &str)> {
-    let marker = line.find(':')?;
-    let path = &line[..marker];
+/// Parse `path:line[:text]` without confusing the colon in the line's content.
+fn split_path_line(line: &str) -> Option<(&str, u32, &str)> {
+    let first_colon = line.find(':')?;
+    let path = &line[..first_colon];
     if path.is_empty() {
         return None;
     }
 
-    let rest = &line[marker..];
-    let mut suffix_body = rest.strip_prefix(':')?;
-    let line_number = suffix_body.split(':').next()?.parse::<usize>().ok()?;
+    let after_path = &line[first_colon + 1..];
+    let digit_len = after_path.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digit_len == 0 {
+        return None;
+    }
 
-    // Preserve the leading colon before the line number and every character
-    // after it, e.g. `:2:Ligne...`.
-    let digits = line_number.to_string();
-    let suffix_start = 1 + digits.len();
-    suffix_body = &rest[suffix_start..];
-    Some((path, suffix_body))
+    let line_number = after_path[..digit_len].parse::<u32>().ok()?;
+    let tail = &after_path[digit_len..];
+    Some((path, line_number, tail))
 }
 
 fn search_result_locations(result: &str, cwd: &Path) -> Vec<ToolCallLocation> {
@@ -382,51 +389,25 @@ fn search_result_locations(result: &str, cwd: &Path) -> Vec<ToolCallLocation> {
     let mut seen = BTreeSet::new();
 
     for line in result.lines() {
-        let Some((path, suffix)) = split_path_line(line) else { continue };
-        let Some(line_number) = suffix
-            .strip_prefix(':')
-            .and_then(|value| value.split(':').next())
-            .and_then(|value| value.parse::<u32>().ok())
-        else {
+        let candidate = if let Some(body) = line.strip_prefix("## ") {
+            body
+        } else {
+            line
+        };
+
+        let Some((path, line_number, _)) = split_path_line(candidate) else {
             continue;
         };
 
         let resolved = resolve_path(path, cwd);
         let key = format!("{}:{line_number}", resolved.display());
 
-        if !seen.insert(key) {
-            continue;
+        if seen.insert(key) {
+            locations.push(ToolCallLocation::new(resolved).line(line_number));
         }
 
-        locations.push(ToolCallLocation::new(resolved).line(line_number));
         if locations.len() >= MAX_RESULT_LOCATIONS {
             break;
-        }
-    }
-
-    // search_and_read headings carry the same `path:line` information but are
-    // preceded by `## `, so parse those as a fallback.
-    if locations.is_empty() {
-        for line in result.lines().filter(|line| line.starts_with("## ")) {
-            let body = &line[3..];
-            let Some((path, suffix)) = split_path_line(body) else { continue };
-            let Some(line_number) = suffix
-                .strip_prefix(':')
-                .and_then(|value| value.split(':').next())
-                .and_then(|value| value.parse::<u32>().ok())
-            else {
-                continue;
-            };
-
-            let resolved = resolve_path(path, cwd);
-            let key = format!("{}:{line_number}", resolved.display());
-            if seen.insert(key) {
-                locations.push(ToolCallLocation::new(resolved).line(line_number));
-            }
-
-            if locations.len() >= MAX_RESULT_LOCATIONS {
-                break;
-            }
         }
     }
 
@@ -602,8 +583,10 @@ mod tests {
         let raw = "/tmp/test-workspace/test_tool_demo.txt:2:Ligne 2\n/tmp/test-workspace/test_tool_demo.txt:3:Ligne 3";
 
         let rendered = normalize_search_result("search", raw, cwd);
-        assert!(rendered.contains("test_tool_demo.txt:2:Ligne 2"));
-        assert!(!rendered.contains("/tmp/test-workspace/test_tool_demo.txt"));
+        assert_eq!(
+            rendered,
+            "test_tool_demo.txt:2:Ligne 2\ntest_tool_demo.txt:3:Ligne 3"
+        );
 
         let locations = search_result_locations(raw, cwd);
         assert_eq!(locations.len(), 2);
@@ -617,6 +600,9 @@ mod tests {
         let rendered = normalize_search_result("search_and_read", raw, cwd);
         assert!(rendered.starts_with("## test_tool_demo.txt:1"));
         assert!(!rendered.contains("/tmp/test-workspace/"));
+
+        let locations = search_result_locations(raw, cwd);
+        assert_eq!(locations.len(), 1);
     }
 
     #[test]
