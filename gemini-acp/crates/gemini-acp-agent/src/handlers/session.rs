@@ -12,7 +12,9 @@
 //! - mode changes emit `CurrentModeUpdate` immediately instead of requiring a
 //!   client refresh;
 //! - invalid lifecycle inputs are rejected as `invalid_params` rather than
-//!   leaking storage errors to the UI.
+//!   leaking storage errors to the UI;
+//! - persisted tool_call/tool_result blocks are reconstructed into real ACP
+//!   tool cards during replay instead of disappearing from the conversation.
 
 use agent_client_protocol::schema::v1::*;
 use agent_client_protocol::{Client, ConnectionTo, Error as AcpError, Responder};
@@ -20,9 +22,10 @@ use tracing::warn;
 
 use gemini_acp_config::config::config_options::build_config_options;
 use gemini_acp_runtime::state::{Role, SessionMode as AcpSessionMode};
+use gemini_acp_runtime::tools::parse::parse_tool_calls;
+use gemini_acp_runtime::tools::tool_ux::{result_update, ToolInfo};
 use gemini_acp_runtime::AppState;
 
-/// ACP session id contract used by the persistent store: `sess_` + 32 lowercase hex characters.
 fn is_valid_session_id(id: &str) -> bool {
     let Some(rest) = id.strip_prefix("sess_") else {
         return false;
@@ -78,6 +81,101 @@ fn send_restored_title(
     Ok(())
 }
 
+fn replay_tool_result(
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    tool_call_index: usize,
+    tool_name: &str,
+    args: &serde_json::Value,
+    result_text: Option<&str>,
+    cwd: &std::path::Path,
+) -> Result<(), AcpError> {
+    let call_id = ToolCallId::from(format!("replay_call_{tool_call_index}"));
+    let info = ToolInfo::build(tool_name, args, cwd, None);
+    cx.send_notification(SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::ToolCall(
+            ToolCall::new(call_id.clone(), info.title.clone())
+                .kind(info.kind)
+                .status(if result_text.is_some() {
+                    ToolCallStatus::Completed
+                } else {
+                    ToolCallStatus::InProgress
+                })
+                .content(info.content.clone())
+                .locations(info.locations.clone())
+                .raw_input(gemini_acp_runtime::tools::tool_ux::bounded_raw_input(args)),
+        ),
+    ))?;
+
+    if let Some(result_text) = result_text {
+        let rendered = result_update(tool_name, args, result_text, true, cwd, None);
+        cx.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(rendered.status)
+                    .content(rendered.content)
+                    .locations(rendered.locations),
+            )),
+        ))?;
+    }
+
+    Ok(())
+}
+
+/// Replay a persisted assistant message and its immediately-following tool results.
+///
+/// The current store persists textual `tool_call` and `tool_result` blocks. We
+/// deliberately use those blocks as the replay source instead of inventing a
+/// second persistence schema. This keeps replay faithful to what is already
+/// stored while restoring genuine ACP ToolCall / ToolCallUpdate events.
+fn replay_assistant_with_tools(
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    message_id: MessageId,
+    text: &str,
+    following_tool_results: &mut std::slice::Iter<'_, (Role, String)>,
+    cwd: &std::path::Path,
+    replay_index: &mut usize,
+) -> Result<(), AcpError> {
+    let (clean_text, calls) = parse_tool_calls(text);
+    if !clean_text.trim().is_empty() {
+        cx.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(ContentBlock::Text(TextContent::new(clean_text)))
+                    .message_id(message_id),
+            ),
+        ))?;
+    }
+
+    for call in calls {
+        let result = following_tool_results
+            .clone()
+            .find_map(|(role, text)| {
+                if *role == Role::Tool {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            });
+        replay_tool_result(
+            cx,
+            session_id,
+            *replay_index,
+            &call.name,
+            &call.arguments,
+            result,
+            cwd,
+        )?;
+        *replay_index += 1;
+    }
+
+    Ok(())
+}
+
 /// `session/new`: persist a new session and return the current configuration/mode state.
 pub async fn handle_new(
     req: NewSessionRequest,
@@ -113,7 +211,6 @@ pub async fn handle_new(
     }
 }
 
-/// `session/list`: list persisted sessions, optionally scoped by cwd.
 pub async fn handle_list(
     req: ListSessionsRequest,
     responder: Responder<ListSessionsResponse>,
@@ -140,11 +237,6 @@ pub async fn handle_list(
     responder.respond(ListSessionsResponse::new(infos))
 }
 
-/// `session/load`: restore the full history before resolving the request.
-///
-/// The title is explicitly replayed as a session update first. This avoids a
-/// visually blank/stale conversation header while the message history is
-/// streaming to a client.
 pub async fn handle_load(
     req: LoadSessionRequest,
     responder: Responder<LoadSessionResponse>,
@@ -167,26 +259,74 @@ pub async fn handle_load(
         }
     };
 
-    send_restored_title(&cx, &req.session_id, session.title.as_deref())?;
+    send_restored_title(cx, &req.session_id, session.title.as_deref())?;
 
-    for (index, (role, text)) in session.messages.iter().enumerate() {
-        let message_id = MessageId::from(format!("msg_{index}"));
-        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone())))
-            .message_id(message_id);
+    let mut replay_index = 0usize;
+    let mut index = 0usize;
+    while index < session.messages.len() {
+        let (role, text) = &session.messages[index];
+        match role {
+            Role::User => {
+                let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone())))
+                    .message_id(MessageId::from(format!("msg_{index}")));
+                cx.send_notification(SessionNotification::new(
+                    req.session_id.clone(),
+                    SessionUpdate::UserMessageChunk(chunk),
+                ))?;
+            }
+            Role::Assistant => {
+                let (_, calls) = parse_tool_calls(text);
+                let mut result_cursor = index + 1;
+                let mut results = Vec::new();
+                while result_cursor < session.messages.len()
+                    && session.messages[result_cursor].0 == Role::Tool
+                    && results.len() < calls.len()
+                {
+                    results.push(session.messages[result_cursor].1.clone());
+                    result_cursor += 1;
+                }
 
-        let update = match role {
-            Role::User => SessionUpdate::UserMessageChunk(chunk),
-            Role::Assistant => SessionUpdate::AgentMessageChunk(chunk),
-            // Tool events are not yet persisted with enough structured fields
-            // to reconstruct a genuine ToolCall/ToolCallUpdate safely. Do not
-            // fabricate a tool card during history replay.
-            Role::Tool => continue,
-        };
+                let mut result_iter = results.iter().map(|text| (Role::Tool, text.clone())).collect::<Vec<_>>();
+                let mut result_refs = result_iter.iter().map(|entry| (&entry.0, &entry.1));
+                let mut tool_results = Vec::new();
+                while let Some((role, text)) = result_refs.next() {
+                    if *role == Role::Tool {
+                        tool_results.push(text.clone());
+                    }
+                }
 
-        cx.send_notification(SessionNotification::new(
-            req.session_id.clone(),
-            update,
-        ))?;
+                let (clean_text, calls) = parse_tool_calls(text);
+                if !clean_text.trim().is_empty() {
+                    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(clean_text)))
+                        .message_id(MessageId::from(format!("msg_{index}")));
+                    cx.send_notification(SessionNotification::new(
+                        req.session_id.clone(),
+                        SessionUpdate::AgentMessageChunk(chunk),
+                    ))?;
+                }
+
+                for (call_index, call) in calls.iter().enumerate() {
+                    let result_text = tool_results.get(call_index).map(String::as_str);
+                    replay_tool_result(
+                        cx,
+                        &req.session_id,
+                        replay_index,
+                        &call.name,
+                        &call.arguments,
+                        result_text,
+                        &session.cwd,
+                    )?;
+                    replay_index += 1;
+                }
+
+                index = result_cursor.saturating_sub(1);
+            }
+            Role::Tool => {
+                // Tool results are consumed together with the preceding assistant
+                // tool_call message so the client receives a coherent card.
+            }
+        }
+        index += 1;
     }
 
     responder.respond(
@@ -200,7 +340,6 @@ pub async fn handle_load(
     )
 }
 
-/// `session/resume`: validate and restore session state without replaying history.
 pub async fn handle_resume(
     req: ResumeSessionRequest,
     responder: Responder<ResumeSessionResponse>,
@@ -236,7 +375,6 @@ pub async fn handle_resume(
     )
 }
 
-/// `session/delete`: permanently remove a session.
 pub async fn handle_delete(
     req: DeleteSessionRequest,
     responder: Responder<DeleteSessionResponse>,
@@ -258,7 +396,6 @@ pub async fn handle_delete(
     }
 }
 
-/// `session/close`: cancel active work and release the live session, keeping persisted state.
 pub async fn handle_close(
     req: CloseSessionRequest,
     responder: Responder<CloseSessionResponse>,
@@ -280,7 +417,6 @@ pub async fn handle_close(
     }
 }
 
-/// `session/set_mode`: update the persisted permission mode and immediately notify the client.
 pub async fn handle_set_mode(
     req: SetSessionModeRequest,
     responder: Responder<SetSessionModeResponse>,
@@ -321,7 +457,6 @@ pub async fn handle_set_mode(
     responder.respond(SetSessionModeResponse::new())
 }
 
-/// `session/fork`: create a new persisted session from an existing conversation.
 pub async fn handle_fork(
     req: ForkSessionRequest,
     responder: Responder<ForkSessionResponse>,
