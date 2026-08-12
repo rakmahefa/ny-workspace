@@ -1,9 +1,9 @@
 //! Builtin tools.
 //!
-//! Filesystem tools are implemented first and remain on the existing `Tool`
-//! trait/registry path. Shell and search stay unchanged until their dedicated
-//! migration phases.
+//! Filesystem, shell, search, and composed tools all implement the same
+//! `Tool` trait and are registered through the existing `ToolRegistry`.
 
+pub mod composed;
 pub mod file;
 pub mod search;
 pub mod shell;
