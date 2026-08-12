@@ -50,6 +50,7 @@ impl ToolLifecycle {
         let allowed = matches!((self.state, next),
             (ToolLifecycleState::Pending, ToolLifecycleState::Permission)
             | (ToolLifecycleState::Pending, ToolLifecycleState::Executing)
+            | (ToolLifecycleState::Pending, ToolLifecycleState::Cancelled)
             | (ToolLifecycleState::Permission, ToolLifecycleState::Executing)
             | (ToolLifecycleState::Permission, ToolLifecycleState::Failed)
             | (ToolLifecycleState::Permission, ToolLifecycleState::Cancelled)
@@ -64,9 +65,6 @@ impl ToolLifecycle {
     pub fn cancel(&mut self) -> Result<(), LifecycleError> { self.transition(ToolLifecycleState::Cancelled) }
 }
 
-// Bridge for session/cancel: Store remains the authoritative turn guard,
-// while the runtime/tool layer can observe cancellation without depending on
-// the agent crate.
 type SessionCancellationMap = HashMap<String, Arc<AtomicBool>>;
 static SESSION_CANCELLATION: OnceLock<Mutex<SessionCancellationMap>> = OnceLock::new();
 
@@ -113,6 +111,13 @@ mod tests {
         lifecycle.transition(ToolLifecycleState::Completed).unwrap();
         assert_eq!(lifecycle.sequence(), 3);
         assert_eq!(lifecycle.state().wire_status(), ToolCallStatus::Completed);
+    }
+    #[test]
+    fn pending_can_be_cancelled_before_execution() {
+        let mut lifecycle = ToolLifecycle::new();
+        lifecycle.cancel().unwrap();
+        assert_eq!(lifecycle.state(), ToolLifecycleState::Cancelled);
+        assert_eq!(lifecycle.state().wire_status(), ToolCallStatus::Failed);
     }
     #[test]
     fn cancellation_is_wire_compatible() {
