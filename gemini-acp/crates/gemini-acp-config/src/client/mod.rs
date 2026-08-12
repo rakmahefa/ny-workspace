@@ -2,7 +2,7 @@
 //! `vendor/gemini-web2api/gemini.py`).
 
 mod config;
-mod payload;
+pub(crate) mod payload;
 mod stream;
 mod upload;
 
@@ -23,7 +23,6 @@ pub struct Client {
 impl Client {
     pub async fn new(config: Config) -> Result<Self> {
         use config::USER_AGENT;
-
         let mut builder = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .connect_timeout(Duration::from_secs(30))
@@ -35,11 +34,7 @@ impl Client {
         match &jar.0 {
             Some(cookies) => {
                 let n = cookies.header().map_or(0, |h| h.split(';').count());
-                debug!(
-                    "cookies chargés: {} paires, SAPISID {}",
-                    n,
-                    if cookies.sapisid().is_some() { "présent" } else { "absent" }
-                );
+                debug!("cookies chargés: {} paires, SAPISID {}", n, if cookies.sapisid().is_some() { "présent" } else { "absent" });
             }
             None => warn!("aucun cookie chargé depuis {:?} — les requêtes échoueront", config.cookie_file),
         }
@@ -54,21 +49,10 @@ impl Client {
         Ok(client)
     }
 
-    pub async fn stream(
-        &self,
-        prompt: &str,
-        model: &str,
-        think: Option<u32>,
-        refs: &[String],
-    ) -> Result<mpsc::Receiver<StreamItem>> {
-        let model_arg = match think {
-            Some(t) => format!("{model}@think={t}"),
-            None => model.to_string(),
-        };
-        let resolved = crate::core::models::resolve(&model_arg, &self.inner.config.default_model)
-            .map_err(|e| anyhow::anyhow!(e))?;
+    pub async fn stream(&self, prompt: &str, model: &str, think: Option<u32>, refs: &[String]) -> Result<mpsc::Receiver<StreamItem>> {
+        let model_arg = match think { Some(t) => format!("{model}@think={t}"), None => model.to_string() };
+        let resolved = crate::core::models::resolve(&model_arg, &self.inner.config.default_model).map_err(|e| anyhow::anyhow!(e))?;
         debug!("stream: {} -> mode {} think {} extra {:?}", resolved.name, resolved.mode, resolved.think, resolved.extra);
-
         let (tx, rx) = mpsc::channel(16);
         let client = self.clone();
         let prompt = prompt.to_string();
@@ -81,20 +65,11 @@ impl Client {
         Ok(rx)
     }
 
-    pub async fn complete(
-        &self,
-        prompt: &str,
-        model: &str,
-        think: Option<u32>,
-        refs: &[String],
-    ) -> Result<String> {
+    pub async fn complete(&self, prompt: &str, model: &str, think: Option<u32>, refs: &[String]) -> Result<String> {
         let mut rx = self.stream(prompt, model, think, refs).await?;
         let mut out = String::new();
         while let Some(item) = rx.recv().await {
-            match item {
-                Ok(delta) => out.push_str(&delta),
-                Err(e) => anyhow::bail!("{e}"),
-            }
+            match item { Ok(delta) => out.push_str(&delta), Err(e) => anyhow::bail!("{e}") }
         }
         Ok(out)
     }
