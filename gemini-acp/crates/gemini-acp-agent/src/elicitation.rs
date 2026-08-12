@@ -1,10 +1,8 @@
-//! Structured ACP elicitation helpers inspired by
+//! Structured ACP elicitation bridge inspired by
 //! `agentclientprotocol/claude-agent-acp/src/elicitation.ts`.
 //!
-//! The bridge keeps transport concerns small and makes the transformation
-//! logic independently testable: generic form/url requests are normalized,
-//! ACP responses become stable Rust outcomes, and AskUserQuestion-style input
-//! can be rendered as an ACP form and folded back into tool input.
+//! The implementation is split into transport-independent normalization,
+//! ACP request/response handling, and AskUserQuestion answer folding.
 
 #![cfg(feature = "elicitation")]
 
@@ -17,78 +15,87 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Client, ConnectionTo, Error as AcpError};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-/// Capabilities advertised by the connected client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ElicitationSupport {
     pub form: bool,
     pub url: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ElicitationMode {
-    Form,
-    Url,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElicitationRequestSpec {
-    pub mode: ElicitationMode,
     pub session_id: SessionId,
     pub message: String,
-    pub requested_schema: Option<BTreeMap<String, ElicitationPropertySchema>>,
-    pub url: Option<String>,
-    pub elicitation_id: Option<String>,
+    pub properties: BTreeMap<String, ElicitationPropertySchema>,
+    pub required: Vec<String>,
 }
 
-/// Normalize an upstream elicitation request into ACP.
-pub fn to_create_request(request: ElicitationRequestSpec) -> Option<CreateElicitationRequest> {
-    match request.mode {
-        ElicitationMode::Form => {
-            let mut schema = ElicitationSchema::new();
-            for (name, property) in request.requested_schema.unwrap_or_default() {
-                schema = schema.property(name, property, false);
-            }
-            let mode = ElicitationFormMode::new(
-                ElicitationSessionScope::new(request.session_id),
-                schema,
-            );
-            Some(CreateElicitationRequest::new(mode, request.message))
+impl ElicitationRequestSpec {
+    pub fn new(session_id: SessionId, message: impl Into<String>) -> Self {
+        Self {
+            session_id,
+            message: message.into(),
+            properties: BTreeMap::new(),
+            required: Vec::new(),
         }
-        ElicitationMode::Url => {
-            let url = request.url?;
-            let id = request
-                .elicitation_id
-                .unwrap_or_else(|| Uuid::new_v4().to_string());
-            let mode = agent_client_protocol::schema::v1::ElicitationUrlMode::new(
-                ElicitationSessionScope::new(request.session_id),
-                url,
-                id,
-            );
-            Some(CreateElicitationRequest::new(mode, request.message))
+    }
+
+    pub fn property(
+        mut self,
+        name: impl Into<String>,
+        schema: ElicitationPropertySchema,
+        required: bool,
+    ) -> Self {
+        let name = name.into();
+        self.properties.insert(name.clone(), schema);
+        if required && !self.required.contains(&name) {
+            self.required.push(name);
         }
+        self
+    }
+
+    fn into_acp_request(self) -> CreateElicitationRequest {
+        let mut schema = ElicitationSchema::new();
+        for (name, property) in self.properties {
+            schema = schema.property(name, property, self.required.contains(&name));
+        }
+        let mode = ElicitationFormMode::new(ElicitationSessionScope::new(self.session_id), schema);
+        CreateElicitationRequest::new(mode, self.message)
     }
 }
 
-/// Send an elicitation request through the connected ACP client.
 pub async fn request_elicitation(
     cx: &ConnectionTo<Client>,
     request: ElicitationRequestSpec,
+) -> Result<ElicitationOutcome, AcpError> {
+    let response: CreateElicitationResponse = cx
+        .send_request(request.into_acp_request())
+        .block_task()
+        .await?;
+    Ok(response_to_outcome(response))
+}
+
+pub async fn elicit_clarification(
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    message: &str,
+    properties: BTreeMap<String, ElicitationPropertySchema>,
+    required: Vec<String>,
 ) -> Result<Option<BTreeMap<String, ElicitationContentValue>>, AcpError> {
-    let wire_request = to_create_request(request).ok_or_else(|| {
-        AcpError::internal_error(
-            "elicitation request cannot be represented by ACP".to_string(),
-        )
-    })?;
+    let outcome = request_elicitation(
+        cx,
+        ElicitationRequestSpec {
+            session_id: session_id.clone(),
+            message: message.to_string(),
+            properties,
+            required,
+        },
+    )
+    .await?;
 
-    let response: CreateElicitationResponse =
-        cx.send_request(wire_request).block_task().await?;
-
-    match response.action {
-        ElicitationAction::Accept(accept) => Ok(accept.content),
-        ElicitationAction::Decline | ElicitationAction::Cancel => Ok(None),
-        _ => Ok(None),
+    match outcome {
+        ElicitationOutcome::Accepted(content) => Ok(Some(content)),
+        ElicitationOutcome::Declined | ElicitationOutcome::Cancelled => Ok(None),
     }
 }
 
@@ -110,7 +117,6 @@ pub fn response_to_outcome(response: CreateElicitationResponse) -> ElicitationOu
     }
 }
 
-/// Normalized AskUserQuestion-style input.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AskUserQuestion {
     pub question: String,
@@ -134,19 +140,21 @@ pub fn extract_ask_user_questions(
     input: &serde_json::Value,
 ) -> Option<Vec<AskUserQuestion>> {
     let questions = input.get("questions")?.as_array()?;
-    let parsed: Vec<AskUserQuestion> = questions
+    let valid: Vec<AskUserQuestion> = questions
         .iter()
         .filter_map(|value| serde_json::from_value(value.clone()).ok())
         .filter(|question: &AskUserQuestion| {
             !question.question.trim().is_empty() && !question.options.is_empty()
         })
         .collect();
-
-    (!parsed.is_empty()).then_some(parsed)
+    (!valid.is_empty()).then_some(valid)
 }
 
-const OPTION_META_KEY: &str = "_claude/askUserQuestionOption";
-const CUSTOM_ANSWER_META_KEY: &str = "_askUserQuestionCustomAnswer";
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AskUserQuestionOutcome {
+    Answered(serde_json::Value),
+    Cancelled,
+}
 
 fn question_key(index: usize) -> String {
     format!("question_{index}")
@@ -156,93 +164,12 @@ fn custom_answer_key(index: usize) -> String {
     format!("question_{index}_custom")
 }
 
-/// Render AskUserQuestion-style input as an ACP form elicitation.
-pub fn ask_user_questions_to_request(
-    questions: &[AskUserQuestion],
-    session_id: SessionId,
-    tool_call_id: Option<String>,
-) -> CreateElicitationRequest {
-    let single = questions.len() == 1;
-    let mut schema = ElicitationSchema::new();
-
-    for (index, question) in questions.iter().enumerate() {
-        let mut options = Vec::with_capacity(question.options.len());
-        for option in &question.options {
-            let mut enum_option = agent_client_protocol::schema::v1::EnumOption::new(
-                option.label.clone(),
-                option.label.clone(),
-            );
-            if let Some(description) = &option.description {
-                enum_option = enum_option.description(description.clone());
-            }
-            if let Some(preview) = &option.preview {
-                enum_option = enum_option.meta(serde_json::json!({
-                    OPTION_META_KEY: { "preview": preview }
-                }));
-            }
-            options.push(enum_option);
-        }
-
-        let description = (!single).then(|| question.question.clone());
-        let property = if question.multi_select {
-            ElicitationPropertySchema::array_of_enum(
-                options,
-                question.header.clone(),
-                description,
-            )
-        } else {
-            ElicitationPropertySchema::string_enum(
-                options,
-                question.header.clone(),
-                description,
-            )
-        };
-        schema = schema.property(question_key(index), property, false);
-
-        let custom = ElicitationPropertySchema::string(
-            Some("Other".to_string()),
-            Some("Type your own answer instead of choosing an option (optional).".to_string()),
-        )
-        .meta(serde_json::json!({
-            CUSTOM_ANSWER_META_KEY: {
-                "questionId": question_key(index),
-                "isCustomAnswer": true
-            }
-        }));
-        schema = schema.property(custom_answer_key(index), custom, false);
-    }
-
-    let mut request = CreateElicitationRequest::new(
-        ElicitationFormMode::new(ElicitationSessionScope::new(session_id), schema),
-        if single {
-            questions
-                .first()
-                .map(|q| q.question.clone())
-                .unwrap_or_default()
-        } else {
-            "Please answer the following questions.".to_string()
-        },
-    );
-
-    if let Some(tool_call_id) = tool_call_id {
-        request = request.tool_call_id(tool_call_id);
-    }
-
-    request
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AskUserQuestionOutcome {
-    Answered(serde_json::Value),
-    Cancelled,
-}
-
 pub fn apply_ask_user_response(
     response: &CreateElicitationResponse,
     tool_input: &serde_json::Value,
     questions: &[AskUserQuestion],
 ) -> AskUserQuestionOutcome {
-    match response.action {
+    match &response.action {
         ElicitationAction::Decline => {
             let mut updated = tool_input.clone();
             updated["answers"] = serde_json::json!({});
@@ -293,14 +220,13 @@ fn elicitation_value_to_json(value: &ElicitationContentValue) -> serde_json::Val
     }
 }
 
-/// Preserve the existing heuristic used by the earlier helper.
 pub fn is_vague_prompt(message: &str) -> bool {
     let lower = message.to_lowercase();
-    const KEYWORDS: &[&str] = &[
+    let vague_keywords = [
         "refactor", "optimise", "optimize", "teste", "test ", "améliore", "ameliore",
         "simplifie", "nettoie", "réécris", "reecris",
     ];
-    KEYWORDS.iter().any(|keyword| lower.contains(keyword)) && message.chars().count() < 80
+    vague_keywords.iter().any(|k| lower.contains(k)) && message.chars().count() < 80
 }
 
 #[cfg(test)]
@@ -311,7 +237,6 @@ mod tests {
         AskUserQuestion {
             question: "Quel langage ?".into(),
             header: Some("Langage".into()),
-            multi_select,
             options: vec![
                 AskUserOption {
                     label: "Rust".into(),
@@ -324,26 +249,24 @@ mod tests {
                     preview: None,
                 },
             ],
+            multi_select,
         }
     }
 
     #[test]
     fn extracts_valid_questions() {
         let input = serde_json::json!({
-            "questions": [serde_json::to_value(question(false)).unwrap(), {"question":"", "options":[]}]
+            "questions": [
+                serde_json::to_value(question(false)).unwrap(),
+                {"question": "", "options": []}
+            ]
         });
-        let result = extract_ask_user_questions(&input).unwrap();
+        let result = extract_ask_user_questions(&input).expect("questions");
         assert_eq!(result.len(), 1);
     }
 
     #[test]
-    fn vague_prompt_matches_existing_behavior() {
-        assert!(is_vague_prompt("Refactor ce fichier"));
-        assert!(!is_vague_prompt("Explique-moi le pattern MVP en Rust"));
-    }
-
-    #[test]
-    fn custom_answer_wins_over_selection() {
+    fn custom_answer_has_priority() {
         let input = serde_json::json!({"questions": []});
         let questions = vec![question(false)];
         let content = BTreeMap::from([(
@@ -355,7 +278,25 @@ mod tests {
             AskUserQuestionOutcome::Answered(updated) => {
                 assert_eq!(updated["answers"]["Quel langage ?"], "Go");
             }
-            AskUserQuestionOutcome::Cancelled => panic!("expected accepted response"),
+            AskUserQuestionOutcome::Cancelled => panic!("expected answer"),
         }
+    }
+
+    #[test]
+    fn decline_produces_empty_answers() {
+        let input = serde_json::json!({"questions": []});
+        let response = CreateElicitationResponse::decline();
+        match apply_ask_user_response(&response, &input, &[question(false)]) {
+            AskUserQuestionOutcome::Answered(updated) => {
+                assert_eq!(updated["answers"], serde_json::json!({}));
+            }
+            AskUserQuestionOutcome::Cancelled => panic!("expected decline to be handled"),
+        }
+    }
+
+    #[test]
+    fn vague_prompt_heuristic_remains_stable() {
+        assert!(is_vague_prompt("Refactor ce fichier"));
+        assert!(!is_vague_prompt("Explique-moi le pattern MVP en Rust"));
     }
 }
