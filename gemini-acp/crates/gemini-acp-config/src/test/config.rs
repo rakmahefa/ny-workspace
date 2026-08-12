@@ -2,7 +2,13 @@ use super::*;
 
 #[test]
 fn config_is_cloneable_and_preserves_values() {
-    let config = AgentConfig { cookie_file: PathBuf::from("cookies.json"), default_model: "model".into(), data_dir: PathBuf::from("/tmp/gemini-acp"), auth_user: Some(2), proxy: Some("http://proxy".into()) };
+    let config = AgentConfig {
+        cookie_file: PathBuf::from("cookies.json"),
+        default_model: "model".into(),
+        data_dir: PathBuf::from("/tmp/gemini-acp"),
+        auth_user: Some(2),
+        proxy: Some("http://proxy".into()),
+    };
     let cloned = config.clone();
     assert_eq!(cloned.cookie_file, config.cookie_file);
     assert_eq!(cloned.default_model, config.default_model);
@@ -13,7 +19,16 @@ fn config_is_cloneable_and_preserves_values() {
 
 #[test]
 fn from_env_defaults_sans_variables() {
-    for key in ["GEMINI_ACP_COOKIES", "GEMINI_ACP_MODEL", "GEMINI_ACP_DATA_DIR", "XDG_DATA_HOME", "GEMINI_ACP_AUTH_USER", "GEMINI_ACP_PROXY"] { std::env::remove_var(key); }
+    for key in [
+        "GEMINI_ACP_COOKIES",
+        "GEMINI_ACP_MODEL",
+        "GEMINI_ACP_DATA_DIR",
+        "XDG_DATA_HOME",
+        "GEMINI_ACP_AUTH_USER",
+        "GEMINI_ACP_PROXY",
+    ] {
+        std::env::remove_var(key);
+    }
     let config = AgentConfig::from_env();
     assert_eq!(config.cookie_file, PathBuf::from("vendor/cookie.json"));
     assert_eq!(config.default_model, crate::core::models::DEFAULT_MODEL);
@@ -32,12 +47,25 @@ fn from_env_lit_les_variables() {
     assert_eq!(config.default_model, "gemini-3.6-flash");
     assert_eq!(config.auth_user, Some(3));
     assert_eq!(config.proxy.as_deref(), Some("http://proxy.local"));
-    for key in ["GEMINI_ACP_COOKIES", "GEMINI_ACP_MODEL", "GEMINI_ACP_AUTH_USER", "GEMINI_ACP_PROXY"] { std::env::remove_var(key); }
+    for key in [
+        "GEMINI_ACP_COOKIES",
+        "GEMINI_ACP_MODEL",
+        "GEMINI_ACP_AUTH_USER",
+        "GEMINI_ACP_PROXY",
+    ] {
+        std::env::remove_var(key);
+    }
 }
 
 #[test]
 fn validate_warns_missing_cookies() {
-    let config = AgentConfig { cookie_file: PathBuf::from("/nonexistent/path/cookies.json"), default_model: "model".into(), data_dir: PathBuf::from("/tmp/gemini-acp"), auth_user: None, proxy: None };
+    let config = AgentConfig {
+        cookie_file: PathBuf::from("/nonexistent/path/cookies.json"),
+        default_model: "model".into(),
+        data_dir: PathBuf::from("/tmp/gemini-acp"),
+        auth_user: None,
+        proxy: None,
+    };
     let warnings = config.validate();
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].0.contains("cookies"));
