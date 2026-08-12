@@ -20,6 +20,8 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 use tokio::sync::{watch, RwLock};
 
+use crate::tools::lifecycle::{cancel_session as cancel_tool_lifecycle, reset_session_cancellation};
+
 pub(crate) use types::MAX_SNAPSHOTS;
 pub use types::{Live, Role, Session, SessionMode, TurnError};
 
@@ -42,6 +44,7 @@ impl Store {
             let gen = entry.generation;
             let (tx, rx) = watch::channel(false);
             entry.cancel = tx;
+            reset_session_cancellation(id);
             let _ = self.acquire_busy(id).await;
             return Ok((entry.session.clone(), rx, gen));
         }
@@ -49,6 +52,7 @@ impl Store {
         let gen = 1u64;
         let (tx, rx) = watch::channel(false);
         live.insert(id.to_string(), Live { session: session.clone(), cancel: tx, busy: true, prompt_handle: None, generation: gen });
+        reset_session_cancellation(id);
         let _ = self.acquire_busy(id).await;
         Ok((session, rx, gen))
     }
@@ -105,9 +109,8 @@ impl Store {
     /// un état cohérent avant que la session redevienne disponible.
     pub async fn cancel(&self, id: &str) {
         let mut live = self.live.write().await;
-        if let Some(entry) = live.get_mut(id) {
-            let _ = entry.cancel.send(true);
-        }
+        if let Some(entry) = live.get_mut(id) { let _ = entry.cancel.send(true); }
+        cancel_tool_lifecycle(id);
     }
 
     /// Annule tous les tours en cours. Les sentinelles `.busy` restent détenues
@@ -115,8 +118,9 @@ impl Store {
     /// nouveau prompt pendant que des tâches annulées sont encore vivantes.
     pub async fn cancel_all(&self) {
         let live = self.live.read().await;
-        for entry in live.values() {
+        for (id, entry) in live.iter() {
             let _ = entry.cancel.send(true);
+            cancel_tool_lifecycle(id);
         }
     }
 
@@ -125,6 +129,7 @@ impl Store {
         let mut live = self.live.write().await;
         let existed = live.contains_key(id) || self.path(id).exists();
         if let Some(entry) = live.get(id) { let _ = entry.cancel.send(true); }
+        cancel_tool_lifecycle(id);
         live.remove(id);
         drop(live);
         self.release_busy(id).await;
