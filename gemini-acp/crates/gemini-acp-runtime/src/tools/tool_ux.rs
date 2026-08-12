@@ -242,11 +242,7 @@ fn search_result(
     cwd: &Path,
 ) -> ResultUpdate {
     let locations = search_result_locations(result, cwd);
-    let displayed = if locations.is_empty() {
-        search_location(args, cwd)
-    } else {
-        locations
-    };
+    let displayed = if locations.is_empty() { search_location(args, cwd) } else { locations };
 
     if !is_ok {
         return ResultUpdate {
@@ -270,11 +266,7 @@ fn search_result(
 fn shell_exec(args: &serde_json::Value, terminal_id: Option<&str>) -> ToolInfo {
     let command = arg_str(args, "command").unwrap_or("");
     let content = terminal_id
-        .map(|id| {
-            vec![ToolCallContent::Terminal(
-                agent_client_protocol::schema::v1::Terminal::new(id.to_owned()),
-            )]
-        })
+        .map(|id| vec![ToolCallContent::Terminal(agent_client_protocol::schema::v1::Terminal::new(id.to_owned()))])
         .unwrap_or_default();
 
     ToolInfo {
@@ -295,18 +287,12 @@ fn shell_result(result: &str, is_ok: bool, terminal_id: Option<&str>) -> ResultU
     };
 
     let content = if terminal_id.is_some() {
-        vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
-            TextContent::new(footer.trim().to_owned()),
-        )))]
+        vec![ToolCallContent::Content(Content::new(ContentBlock::Text(TextContent::new(footer.trim().to_owned()))))]
     } else {
         text_content(&format!("```console\n{}\n```{footer}", result.trim_end()), !is_ok)
     };
 
-    ResultUpdate {
-        status: status_for(is_ok),
-        content,
-        locations: vec![],
-    }
+    ResultUpdate { status: status_for(is_ok), content, locations: vec![] }
 }
 
 fn ask_user_question(args: &serde_json::Value) -> ToolInfo {
@@ -342,38 +328,23 @@ fn generic(name: &str, args: &serde_json::Value) -> ToolInfo {
         content: if args.as_object().map_or(true, |obj| obj.is_empty()) {
             vec![]
         } else {
-            vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
-                TextContent::new(concise_args(args)),
-            )))]
+            vec![ToolCallContent::Content(Content::new(ContentBlock::Text(TextContent::new(concise_args(args))))) ]
         },
         locations: vec![],
     }
 }
 
 fn text_content(text: &str, error: bool) -> Vec<ToolCallContent> {
-    let rendered = if error {
-        format!("```text\n{text}\n```")
-    } else {
-        text.to_owned()
-    };
-
-    vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
-        TextContent::new(rendered),
-    )))]
+    let rendered = if error { format!("```text\n{text}\n```") } else { text.to_owned() };
+    vec![ToolCallContent::Content(Content::new(ContentBlock::Text(TextContent::new(rendered))))]
 }
 
 fn status_for(is_ok: bool) -> ToolCallStatus {
-    if is_ok {
-        ToolCallStatus::Completed
-    } else {
-        ToolCallStatus::Failed
-    }
+    if is_ok { ToolCallStatus::Completed } else { ToolCallStatus::Failed }
 }
 
 fn file_location(args: &serde_json::Value, cwd: &Path) -> Vec<ToolCallLocation> {
-    arg_str(args, "path")
-        .map(|path| vec![ToolCallLocation::new(resolve_path(path, cwd))])
-        .unwrap_or_default()
+    arg_str(args, "path").map(|path| vec![ToolCallLocation::new(resolve_path(path, cwd))]).unwrap_or_default()
 }
 
 fn search_location(args: &serde_json::Value, cwd: &Path) -> Vec<ToolCallLocation> {
@@ -382,104 +353,60 @@ fn search_location(args: &serde_json::Value, cwd: &Path) -> Vec<ToolCallLocation
 }
 
 fn numbered_preview(result: &str, start: usize, max_lines: usize) -> String {
-    result
-        .lines()
-        .take(max_lines)
-        .enumerate()
-        .map(|(idx, line)| format!("{:>4} │ {}", start + idx, line))
-        .collect::<Vec<_>>()
-        .join("\n")
+    result.lines().take(max_lines).enumerate().map(|(idx, line)| format!("{:>4} │ {}", start + idx, line)).collect::<Vec<_>>().join("\n")
 }
 
 fn summarize_edit_result(result: &str, is_ok: bool) -> String {
-    if !is_ok {
-        return "Edit failed".to_owned();
-    }
+    if !is_ok { return "Edit failed".to_owned(); }
     let lower = result.to_ascii_lowercase();
     if lower.contains("replacement") || lower.contains("replaced") {
-        let number = lower
-            .split_whitespace()
-            .find_map(|token| token.parse::<usize>().ok())
-            .unwrap_or(1);
-        return if number == 1 {
-            "1 Replacement".to_owned()
-        } else {
-            format!("{number} Replacements")
-        };
+        let number = lower.split_whitespace().find_map(|token| token.parse::<usize>().ok()).unwrap_or(1);
+        return if number == 1 { "1 Replacement".to_owned() } else { format!("{number} Replacements") };
     }
     "File Updated".to_owned()
 }
 
 fn search_match_count(result: &str) -> usize {
-    result
-        .lines()
-        .filter(|line| split_path_line(line).is_some() || line.starts_with("## "))
-        .count()
-        .max(if result.trim().is_empty() { 0 } else { 1 })
+    result.lines().filter(|line| split_path_line(line).is_some() || line.starts_with("## ")).count()
 }
 
 fn extract_exit_code(result: &str, is_ok: bool) -> Option<i32> {
-    let needle = "exit code";
-    result
-        .to_ascii_lowercase()
-        .split(needle)
-        .nth(1)
-        .and_then(|tail| tail.split_whitespace().find_map(|token| token.trim_matches(|c: char| !c.is_ascii_digit() && c != '-').parse::<i32>().ok()))
-        .or_else(|| if is_ok { Some(0) } else { None })
+    result.to_ascii_lowercase().split("exit code").nth(1).and_then(|tail| tail.split_whitespace().find_map(|token| token.trim_matches(|c: char| !c.is_ascii_digit() && c != '-').parse::<i32>().ok())).or_else(|| if is_ok { Some(0) } else { None })
 }
 
 fn extract_question(args: &serde_json::Value) -> Option<String> {
-    if let Some(question) = args.get("question").and_then(serde_json::Value::as_str) {
-        return Some(question.to_owned());
-    }
+    if let Some(question) = args.get("question").and_then(serde_json::Value::as_str) { return Some(question.to_owned()); }
     let questions = args.get("questions")?.as_array()?;
-    questions
-        .first()
-        .and_then(|item| item.get("question").and_then(serde_json::Value::as_str))
-        .map(str::to_owned)
+    questions.first().and_then(|item| item.get("question").and_then(serde_json::Value::as_str)).map(str::to_owned)
 }
 
 fn normalize_search_result(tool_name: &str, result: &str, cwd: &Path) -> String {
     let mut output = String::with_capacity(result.len());
     for (index, line) in result.lines().enumerate() {
-        if index > 0 {
-            output.push('\n');
-        }
-        if tool_name == "search_and_read" && line.starts_with("## ") {
-            output.push_str(&normalize_heading_path(line, cwd));
-        } else {
-            output.push_str(&normalize_match_line(line, cwd));
-        }
+        if index > 0 { output.push('\n'); }
+        if tool_name == "search_and_read" && line.starts_with("## ") { output.push_str(&normalize_heading_path(line, cwd)); } else { output.push_str(&normalize_match_line(line, cwd)); }
     }
     output
 }
 
 fn normalize_heading_path(line: &str, cwd: &Path) -> String {
     let body = &line[3..];
-    let Some((path, line_number, tail)) = split_path_line(body) else {
-        return line.to_owned();
-    };
+    let Some((path, line_number, tail)) = split_path_line(body) else { return line.to_owned(); };
     format!("## {}:{}{}", display_path(path, cwd), line_number, tail)
 }
 
 fn normalize_match_line(line: &str, cwd: &Path) -> String {
-    let Some((path, line_number, tail)) = split_path_line(line) else {
-        return line.to_owned();
-    };
+    let Some((path, line_number, tail)) = split_path_line(line) else { return line.to_owned(); };
     format!("{}:{}{}", display_path(path, cwd), line_number, tail)
 }
 
 fn split_path_line(line: &str) -> Option<(&str, u32, &str)> {
     let first_colon = line.find(':')?;
     let path = &line[..first_colon];
-    if path.is_empty() {
-        return None;
-    }
+    if path.is_empty() { return None; }
     let after_path = &line[first_colon + 1..];
     let digit_len = after_path.chars().take_while(|c| c.is_ascii_digit()).count();
-    if digit_len == 0 {
-        return None;
-    }
+    if digit_len == 0 { return None; }
     let line_number = after_path[..digit_len].parse::<u32>().ok()?;
     Some((path, line_number, &after_path[digit_len..]))
 }
@@ -487,25 +414,18 @@ fn split_path_line(line: &str) -> Option<(&str, u32, &str)> {
 fn search_result_locations(result: &str, cwd: &Path) -> Vec<ToolCallLocation> {
     let mut locations = Vec::new();
     let mut seen = BTreeSet::new();
-
     for line in result.lines() {
         let candidate = line.strip_prefix("## ").unwrap_or(line);
         let Some((path, line_number, _)) = split_path_line(candidate) else { continue };
         let resolved = resolve_path(path, cwd);
         let key = format!("{}:{line_number}", resolved.display());
-        if seen.insert(key) {
-            locations.push(ToolCallLocation::new(resolved).line(line_number));
-        }
-        if locations.len() >= MAX_RESULT_LOCATIONS {
-            break;
-        }
+        if seen.insert(key) { locations.push(ToolCallLocation::new(resolved).line(line_number)); }
+        if locations.len() >= MAX_RESULT_LOCATIONS { break; }
     }
     locations
 }
 
-fn arg_str<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
-    args.get(key).and_then(serde_json::Value::as_str)
-}
+fn arg_str<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> { args.get(key).and_then(serde_json::Value::as_str) }
 
 fn resolve_path(path: &str, cwd: &Path) -> PathBuf {
     let candidate = PathBuf::from(path);
@@ -539,10 +459,7 @@ fn concise_args(args: &serde_json::Value) -> String {
 
 pub fn classify_risk(name: &str, args: &serde_json::Value) -> RiskLevel {
     match name {
-        "shell_exec" => arg_str(args, "command")
-            .and_then(|command| ShellSandbox::new().analyze_command(command).ok())
-            .map(|ShellAnalysis { risk, .. }| risk)
-            .unwrap_or(RiskLevel::Critical),
+        "shell_exec" => arg_str(args, "command").and_then(|command| ShellSandbox::new().analyze_command(command).ok()).map(|ShellAnalysis { risk, .. }| risk).unwrap_or(RiskLevel::Critical),
         "file_write" | "file_edit" | "replace_in_file" => RiskLevel::Medium,
         "AskUserQuestion" | "ask_user_question" => RiskLevel::Medium,
         _ => RiskLevel::Low,
@@ -556,22 +473,10 @@ mod tests {
     #[test]
     fn visual_titles_match_requested_layout() {
         let cwd = Path::new("/tmp/test-workspace");
-        assert_eq!(
-            ToolInfo::build("file_read", &serde_json::json!({"path":"src/index.ts","offset":1,"limit":2}), cwd, None).title,
-            "📖 file_read · src/index.ts"
-        );
-        assert_eq!(
-            ToolInfo::build("file_write", &serde_json::json!({"path":"src/server.ts","content":"const PORT = 3000;"}), cwd, None).title,
-            "✏️ file_write · src/server.ts"
-        );
-        assert_eq!(
-            ToolInfo::build("search", &serde_json::json!({"pattern":"connectDB","path":"src"}), cwd, None).title,
-            "🔍 search · \"connectDB\" · src"
-        );
-        assert_eq!(
-            ToolInfo::build("shell_exec", &serde_json::json!({"command":"pnpm test"}), cwd, None).title,
-            "⚡ shell_exec · pnpm test"
-        );
+        assert_eq!(ToolInfo::build("file_read", &serde_json::json!({"path":"src/index.ts","offset":1,"limit":2}), cwd, None).title, "📖 file_read · src/index.ts");
+        assert_eq!(ToolInfo::build("file_write", &serde_json::json!({"path":"src/server.ts","content":"const PORT = 3000;"}), cwd, None).title, "✏️ file_write · src/server.ts");
+        assert_eq!(ToolInfo::build("search", &serde_json::json!({"pattern":"connectDB","path":"src"}), cwd, None).title, "🔍 search · \"connectDB\" · src");
+        assert_eq!(ToolInfo::build("shell_exec", &serde_json::json!({"command":"pnpm test"}), cwd, None).title, "⚡ shell_exec · pnpm test");
         assert_eq!(ToolInfo::build("AskUserQuestion", &serde_json::json!({"question":"Migrations en prod ?"}), cwd, None).title, "❓ AskUserQuestion");
     }
 
@@ -599,6 +504,12 @@ mod tests {
         let rendered = normalize_search_result("search", raw, cwd);
         assert_eq!(rendered, "test_tool_demo.txt:2:Ligne 2\ntest_tool_demo.txt:3:Ligne 3");
         assert_eq!(search_result_locations(raw, cwd).len(), 2);
+    }
+
+    #[test]
+    fn zero_search_results_are_reported_as_zero() {
+        assert_eq!(search_match_count(""), 0);
+        assert_eq!(search_match_count("no match"), 0);
     }
 
     #[test]
