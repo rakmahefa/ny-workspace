@@ -11,6 +11,8 @@
 //! - **Prompt serialization** : le handler prompt attend le prompt précédent
 //!   via `store.wait_prompt_done` avant de s'enregistrer (bug de concurrence C
 //!   — spec §4).
+//! - **Interactive tool context** : chaque tour reçoit un contexte ACP task-local
+//!   pour les outils comme `AskUserQuestion`, isolé par tâche/session.
 //!
 //! Refactor 3-crates (spec §5.2) : ce crate ne possède plus son propre
 //! `AppState` — il réutilise directement `gemini_acp_runtime::AppState`,
@@ -72,6 +74,7 @@ pub async fn run_agent(state: AppState) -> Result<(), AcpError> {
                     let client = client.clone();
                     let tools = tools.clone();
                     let sid = req.session_id.0.clone();
+                    let session_id = req.session_id.clone();
                     let store_for_handle = store.clone();
 
                     // 1) Attendre la fin du tour précédent AVANT de s'enregistrer.
@@ -83,8 +86,17 @@ pub async fn run_agent(state: AppState) -> Result<(), AcpError> {
                     store_for_handle.set_prompt_handle(&sid, done_rx).await;
 
                     let _ = cx.spawn(async move {
-                        let result =
-                            prompt::run_turn(store, tools, client, req, responder, turn_cx).await;
+                        let interactive = gemini_acp_runtime::tools::interactive::InteractiveContext {
+                            cx: turn_cx.clone(),
+                            session_id,
+                        };
+                        let result = gemini_acp_runtime::tools::interactive::scope(
+                            interactive,
+                            async move {
+                                prompt::run_turn(store, tools, client, req, responder, turn_cx).await
+                            },
+                        )
+                        .await;
                         let _ = done_tx.send(());
                         result
                     });

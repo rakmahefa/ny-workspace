@@ -11,7 +11,7 @@ description = "Runtime agent ACP : état, outils, persistance sessions"
 
 [dependencies]
 gemini-acp-config = { path = "../gemini-acp-config" }
-agent-client-protocol = { workspace = true }
+agent-client-protocol = { workspace = true, features = ["unstable_elicitation"] }
 # Non listé dans spec.md §4.3 (omission) mais requis par tools/sandbox.rs et
 # tools/parse.rs (regex statiques pour l'analyse shell / le parsing tool_call).
 regex = { workspace = true }
