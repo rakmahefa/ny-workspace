@@ -428,7 +428,7 @@ fn read_old_text(path: &Path) -> Option<String> {
 fn bounded_raw_input(input: &serde_json::Value) -> serde_json::Value {
     let mut value = input.clone();
     if let Some(object) = value.as_object_mut() {
-        if let Some(content) = object.get_mut("content").and_then(serde_json::Value::as_str) {
+        if let Some(content) = object.get_mut("content").as_deref().and_then(|arg0: &serde_json::Value| serde_json::Value::as_str(&*arg0)) {
             if content.chars().count() > MAX_RAW_INPUT_CHARS {
                 let preview: String = content.chars().take(MAX_RAW_INPUT_CHARS).collect();
                 *object.get_mut("content").expect("content exists") = serde_json::Value::String(format!(
