@@ -1,121 +1,31 @@
-//! Tool execution and real ACP permission handling.
+//! Tool executor with Claude-style ACP UX and real ACP permissions.
 //!
-//! Permission requests are sent to the ACP client with `session/request_permission`.
-//! The old local oneshot/timeout broker intentionally does not exist anymore: in
-//! `default` mode a mutating tool is blocked until the client answers.
+//! The execution pipeline intentionally mirrors the separation used by
+//! `agentclientprotocol/claude-agent-acp/src/tools.ts`:
+//!
+//! 1. build a structured tool presentation (title/kind/content/locations),
+//! 2. announce `tool_call`,
+//! 3. request ACP permission when policy requires it,
+//! 4. execute the tool (terminal UX is delegated to ACP when available),
+//! 5. render the result with a tool-specific ACP update,
+//! 6. finish with `completed` / `failed`.
 
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol::schema::v1::{
-    Content, ContentBlock, PermissionOption, PermissionOptionKind, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionId, SessionNotification, SessionUpdate, TextContent,
+    Content, ContentBlock, CreateTerminalRequest, PermissionOption, PermissionOptionKind,
+    ReleaseTerminalRequest, RequestPermissionOutcome, RequestPermissionRequest, SessionId,
+    SessionNotification, SessionUpdate, Terminal, TerminalOutputRequest, TextContent,
     ToolCall as AcpToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind,
+    ToolCallUpdateFields, ToolKind, WaitForTerminalExitRequest,
 };
 use agent_client_protocol::{Client, ConnectionTo};
 
 use crate::state::SessionMode;
-use super::registry::ToolRegistry;
+
+use super::registry::{ToolRegistry, ToolResult as RegistryToolResult};
 use super::sandbox::{RiskLevel, ShellAnalysis, ShellSandbox};
-
-/// Human-readable metadata used both by tool_call notifications and permission UI.
-#[derive(Debug, Clone)]
-pub struct ToolCallMetadata {
-    pub title: String,
-    pub description: String,
-    pub risk: RiskLevel,
-    pub kind: ToolKind,
-}
-
-impl ToolCallMetadata {
-    pub fn build(tool_name: &str, arguments: &serde_json::Value) -> Self {
-        match tool_name {
-            "file_read" => Self::file_read(arguments),
-            "file_write" => Self::file_write(arguments),
-            "shell_exec" => Self::shell_exec(arguments),
-            "search" => Self::search(arguments),
-            _ => Self {
-                title: tool_name.to_string(),
-                description: format!(
-                    "Outil : {}\nArguments : {}",
-                    tool_name,
-                    serde_json::to_string_pretty(arguments).unwrap_or_else(|_| arguments.to_string())
-                ),
-                risk: RiskLevel::Medium,
-                kind: ToolKind::Other,
-            },
-        }
-    }
-
-    fn file_read(args: &serde_json::Value) -> Self {
-        let path = arg_str(args, "path").unwrap_or("<path manquant>");
-        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
-        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(500);
-        let mut description = format!("Lecture du fichier : {}", path);
-        if offset > 0 || limit < 500 {
-            description.push_str(&format!(" (lignes {}..{}, max {})", offset, offset + limit, limit));
-        }
-        if let Ok(metadata) = std::fs::metadata(path) {
-            description.push_str(&format!("\nTaille : {}", format_size(metadata.len())));
-        }
-        Self {
-            title: format!("Read: {}", truncate_path(path, 60)),
-            description,
-            risk: RiskLevel::Low,
-            kind: ToolKind::Read,
-        }
-    }
-
-    fn file_write(args: &serde_json::Value) -> Self {
-        let path = arg_str(args, "path").unwrap_or("<path manquant>");
-        let content = arg_str(args, "content").unwrap_or("");
-        let action = if std::fs::metadata(path).is_ok() { "Modification" } else { "Création" };
-        Self {
-            title: format!("Write: {}", truncate_path(path, 60)),
-            description: format!(
-                "{} du fichier : {}\nTaille : {} ({} octets)\nLignes : {}",
-                action, path, format_size(content.len() as u64), content.len(), content.lines().count()
-            ),
-            risk: RiskLevel::Medium,
-            kind: ToolKind::Edit,
-        }
-    }
-
-    fn shell_exec(args: &serde_json::Value) -> Self {
-        let command = arg_str(args, "command").unwrap_or("<commande manquante>");
-        let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
-        match ShellSandbox::new().analyze_command(command) {
-            Ok(analysis) => Self {
-                title: format!("Exec: {}", truncate_cmd(command, 60)),
-                description: format!(
-                    "{}\nRisque : {} {}\nTimeout : {}s\n{}",
-                    analysis.summary(), analysis.risk.emoji(), analysis.risk.label(), timeout,
-                    analysis.risk_description
-                ),
-                risk: analysis.risk,
-                kind: ToolKind::Execute,
-            },
-            Err(error) => Self {
-                title: format!("Exec: {}", truncate_cmd(command, 60)),
-                description: format!("Commande bloquée par la sandbox : {}\n{}", command, error),
-                risk: RiskLevel::Critical,
-                kind: ToolKind::Execute,
-            },
-        }
-    }
-
-    fn search(args: &serde_json::Value) -> Self {
-        let pattern = arg_str(args, "pattern").unwrap_or("<pattern manquant>");
-        let path = arg_str(args, "path").unwrap_or("CWD");
-        let glob = arg_str(args, "glob").unwrap_or("all files");
-        Self {
-            title: format!("Search: {}", truncate_cmd(pattern, 60)),
-            description: format!("Recherche : '{}' dans {}\nFiltre : {}", pattern, path, glob),
-            risk: RiskLevel::Low,
-            kind: ToolKind::Read,
-        }
-    }
-}
+use super::tool_ux::{bounded_raw_input, classify_risk, result_update, ToolInfo};
 
 #[derive(Debug, Clone)]
 pub struct PermissionRequest {
@@ -137,24 +47,33 @@ pub enum PermissionKind {
 }
 
 impl PermissionRequest {
-    pub fn from_tool_call(tool_name: &str, args: &serde_json::Value) -> Self {
-        let metadata = ToolCallMetadata::build(tool_name, args);
-        let kind = match tool_name {
-            "file_read" | "search" => PermissionKind::Read,
-            "file_write" => PermissionKind::Write,
+    pub fn from_tool_call(tool_name: &str, args: &serde_json::Value, cwd: &Path) -> Self {
+        let info = ToolInfo::build(tool_name, args, cwd, None);
+        let kind = match info.kind {
+            ToolKind::Read | ToolKind::Search => PermissionKind::Read,
+            ToolKind::Edit => PermissionKind::Write,
+            ToolKind::Execute => PermissionKind::Execute,
             _ => PermissionKind::Execute,
         };
+
+        let risk = classify_risk(tool_name, args);
         let mut warnings = Vec::new();
+
         match tool_name {
-            "file_write" => {
-                if let Some(path) = arg_str(args, "path") {
-                    if std::fs::metadata(path).is_ok() {
-                        warnings.push(format!("Le fichier '{}' existe déjà et sera modifié.", path));
+            "file_write" | "file_edit" | "replace_in_file" => {
+                if let Some(path) = args.get("path").and_then(serde_json::Value::as_str) {
+                    let resolved = if Path::new(path).is_absolute() {
+                        PathBuf::from(path)
+                    } else {
+                        cwd.join(path)
+                    };
+                    if resolved.exists() {
+                        warnings.push(format!("Le fichier '{}' existe déjà et sera modifié.", info.title));
                     }
                 }
             }
             "shell_exec" => {
-                let command = arg_str(args, "command").unwrap_or("");
+                let command = args.get("command").and_then(serde_json::Value::as_str).unwrap_or("");
                 let analysis = ShellAnalysis::analyze(command);
                 if analysis.has_dangerous_pipe_chain {
                     warnings.push("Chaîne de commandes potentiellement dangereuse détectée.".into());
@@ -168,20 +87,29 @@ impl PermissionRequest {
             }
             _ => {}
         }
-        if metadata.risk >= RiskLevel::High {
+
+        if risk >= RiskLevel::High {
             warnings.push("Cette opération peut avoir des effets irréversibles.".into());
         }
-        let warning_text = if warnings.is_empty() {
-            String::new()
+
+        let detail = if warnings.is_empty() {
+            format!("{}\n{} {}", info.title, risk.emoji(), risk.label())
         } else {
-            format!("\nAvertissements :\n{}", warnings.iter().map(|w| format!("  - {w}")).collect::<Vec<_>>().join("\n"))
+            format!(
+                "{}\n{} {}\n\nAvertissements :\n{}",
+                info.title,
+                risk.emoji(),
+                risk.label(),
+                warnings.iter().map(|warning| format!("  - {warning}")).collect::<Vec<_>>().join("\n")
+            )
         };
+
         Self {
             kind,
-            risk: metadata.risk,
-            summary: metadata.title,
-            detail: format!("{}\n{} {}{}", metadata.description, metadata.risk.emoji(), metadata.risk.label(), warning_text),
-            tool_name: tool_name.to_string(),
+            risk,
+            summary: info.title,
+            detail,
+            tool_name: tool_name.to_owned(),
             warnings,
         }
     }
@@ -190,27 +118,29 @@ impl PermissionRequest {
 #[derive(Debug, Clone)]
 pub struct ToolResult {
     pub content: String,
-    #[allow(dead_code)]
     pub is_ok: bool,
 }
 
 impl ToolResult {
-    #[allow(dead_code)]
-    pub fn ok(content: impl Into<String>) -> Self { Self { content: content.into(), is_ok: true } }
-    pub fn err(content: impl Into<String>) -> Self { Self { content: content.into(), is_ok: false } }
+    pub fn err(content: impl Into<String>) -> Self {
+        Self { content: content.into(), is_ok: false }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionResult {
     Allow,
-    #[allow(dead_code)]
     Reject,
     Cancelled,
-    #[allow(dead_code)]
     TransportError(String),
 }
 
-/// Central tool executor. ACP permission requests are sent directly through `ConnectionTo<Client>`.
+#[derive(Debug)]
+struct ExecutionOutcome {
+    result: ToolResult,
+    terminal_id: Option<String>,
+}
+
 pub struct ToolExecutor<'a> {
     cx: &'a ConnectionTo<Client>,
     session_id: &'a SessionId,
@@ -234,59 +164,137 @@ impl<'a> ToolExecutor<'a> {
 
     pub async fn execute(&self, tool_name: &str, arguments: &serde_json::Value) -> ToolResult {
         let call_id = ToolCallId::from(format!("call_{}", uuid::Uuid::new_v4().simple()));
-        let metadata = ToolCallMetadata::build(tool_name, arguments);
+        let info = ToolInfo::build(tool_name, arguments, self.cwd, None);
         let mode = (self.get_mode)();
-        let needs_permission = match metadata.kind {
-            ToolKind::Edit | ToolKind::Execute => !matches!(mode, SessionMode::BypassPermissions),
-            ToolKind::Read => false,
-            _ => metadata.risk >= RiskLevel::High && matches!(mode, SessionMode::AcceptEdits),
+        let needs_permission = match info.kind {
+            ToolKind::Edit | ToolKind::Execute => match mode {
+                SessionMode::BypassPermissions => false,
+                SessionMode::AcceptEdits => info.kind == ToolKind::Execute && classify_risk(tool_name, arguments) >= RiskLevel::High,
+                SessionMode::Default => true,
+            },
+            _ => false,
         };
 
-        self.emit_tool_call(&call_id, &metadata, if needs_permission { ToolCallStatus::Pending } else { ToolCallStatus::InProgress }, arguments);
+        self.emit_tool_call(&call_id, &info, if needs_permission { ToolCallStatus::Pending } else { ToolCallStatus::InProgress }, arguments);
 
         if needs_permission {
-            let request = PermissionRequest::from_tool_call(tool_name, arguments);
-            match self.request_permission(&call_id, &request).await {
-                PermissionResult::Allow => self.emit_tool_call_update_status(&call_id, ToolCallStatus::InProgress),
+            let request = PermissionRequest::from_tool_call(tool_name, arguments, self.cwd);
+            match self.request_permission(&request, &call_id).await {
+                PermissionResult::Allow => self.emit_status(&call_id, ToolCallStatus::InProgress),
                 PermissionResult::Reject => {
                     let message = format!("{} ({}) refusé par l'utilisateur.", request.kind.label(), request.summary);
-                    self.emit_tool_call_update_failed(&call_id, &message);
+                    self.emit_failed(&call_id, &message, arguments, tool_name);
                     return ToolResult::err(message);
                 }
                 PermissionResult::Cancelled => {
                     let message = format!("{} ({}) annulé par l'utilisateur.", request.kind.label(), request.summary);
-                    self.emit_tool_call_update_failed(&call_id, &message);
+                    self.emit_failed(&call_id, &message, arguments, tool_name);
                     return ToolResult::err(message);
                 }
                 PermissionResult::TransportError(error) => {
                     let message = format!("Échec de la demande de permission ACP : {error}");
-                    self.emit_tool_call_update_failed(&call_id, &message);
+                    self.emit_failed(&call_id, &message, arguments, tool_name);
                     return ToolResult::err(message);
                 }
             }
         }
 
+        let outcome = if tool_name == "shell_exec" {
+            match self.execute_shell_via_acp_terminal(arguments, &call_id).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::debug!(session = %self.session_id, error = %error, "terminal ACP indisponible, fallback shell local");
+                    self.execute_registry(tool_name, arguments).await
+                }
+            }
+        } else {
+            self.execute_registry(tool_name, arguments).await
+        };
+
+        let rendered = result_update(
+            tool_name,
+            arguments,
+            &outcome.result.content,
+            outcome.result.is_ok,
+            self.cwd,
+            outcome.terminal_id.as_deref(),
+        );
+        self.emit_update(&call_id, rendered.status, rendered.content, rendered.locations);
+        outcome.result
+    }
+
+    async fn execute_registry(&self, tool_name: &str, arguments: &serde_json::Value) -> ExecutionOutcome {
         match self.registry.call_async(tool_name, arguments, self.cwd, self.additional_dirs).await {
-            Some(result) => {
-                let status = if result.is_ok() { ToolCallStatus::Completed } else { ToolCallStatus::Failed };
-                let text = result.to_history_text();
-                self.emit_tool_call_update_with_content(&call_id, status, &text);
-                ToolResult { content: text, is_ok: result.is_ok() }
-            }
-            None => {
-                let message = format!("Unknown tool: {tool_name}");
-                tracing::warn!(session = %self.session_id, tool = %tool_name, "outil inconnu");
-                self.emit_tool_call_update_failed(&call_id, &message);
-                ToolResult::err(message)
-            }
+            Some(result) => ExecutionOutcome { result: registry_result(result), terminal_id: None },
+            None => ExecutionOutcome { result: ToolResult::err(format!("Outil inconnu : {tool_name}")), terminal_id: None },
         }
     }
 
-    /// Send the standard ACP `session/request_permission` request and wait for the client's response.
-    ///
-    /// The request is made from the spawned prompt task, not from the ACP dispatch loop, so
-    /// `block_task()` is safe and does not deadlock the connection.
-    pub async fn request_permission(&self, call_id: &ToolCallId, request: &PermissionRequest) -> PermissionResult {
+    async fn execute_shell_via_acp_terminal(
+        &self,
+        arguments: &serde_json::Value,
+        call_id: &ToolCallId,
+    ) -> anyhow::Result<ExecutionOutcome> {
+        let command = arguments
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .filter(|command| !command.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("paramètre 'command' manquant ou vide"))?;
+
+        ShellSandbox::new().analyze_command(command).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+        let timeout = arguments.get("timeout").and_then(|value| value.as_u64()).unwrap_or(30).clamp(1, 120);
+        let request = CreateTerminalRequest::new(self.session_id.clone(), "sh")
+            .args(vec!["-c".to_owned(), command.to_owned()])
+            .cwd(self.cwd.to_path_buf())
+            .output_byte_limit(64 * 1024);
+
+        let response = self.cx.send_request(request).block_task().await?;
+        let terminal_id = response.terminal_id;
+
+        self.emit_update(
+            call_id,
+            ToolCallStatus::InProgress,
+            vec![ToolCallContent::Terminal(Terminal::new(terminal_id.clone()))],
+            vec![],
+        );
+
+        let wait = WaitForTerminalExitRequest::new(self.session_id.clone(), terminal_id.clone());
+        let wait_response = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout + 5),
+            self.cx.send_request(wait).block_task(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("terminal timeout après {timeout}s"))??;
+
+        let output_response = self
+            .cx
+            .send_request(TerminalOutputRequest::new(self.session_id.clone(), terminal_id.clone()))
+            .block_task()
+            .await?;
+
+        let output = output_response.output;
+        let exit_code = wait_response.exit_status.as_ref().and_then(|status| status.exit_code);
+        let is_ok = exit_code.unwrap_or(0) == 0;
+
+        let _ = self
+            .cx
+            .send_request(ReleaseTerminalRequest::new(self.session_id.clone(), terminal_id.clone()))
+            .block_task()
+            .await;
+
+        let text = if output.trim().is_empty() {
+            match exit_code { Some(code) => format!("exit code {code}"), None => "(sortie vide)".to_owned() }
+        } else if output_response.truncated {
+            format!("{output}\n… (sortie tronquée par le client ACP)")
+        } else {
+            output
+        };
+
+        Ok(ExecutionOutcome { result: ToolResult { content: text, is_ok }, terminal_id: Some(terminal_id.0.to_string()) })
+    }
+
+    pub async fn request_permission(&self, request: &PermissionRequest, call_id: &ToolCallId) -> PermissionResult {
         let tool_call = AcpToolCall::new(call_id.clone(), request.summary.clone())
             .kind(match request.kind {
                 PermissionKind::Read => ToolKind::Read,
@@ -321,56 +329,47 @@ impl<'a> ToolExecutor<'a> {
 
         match response.outcome {
             RequestPermissionOutcome::Cancelled => PermissionResult::Cancelled,
-            RequestPermissionOutcome::Selected(selected) => {
-                match selected.option_id.0.as_ref() {
-                    "allow_once" | "allow_always" => {
-                        tracing::info!(session = %self.session_id, tool = %request.tool_name, option = %selected.option_id, "permission ACP accordée");
-                        PermissionResult::Allow
-                    }
-                    "reject_once" | "reject_always" => {
-                        tracing::info!(session = %self.session_id, tool = %request.tool_name, option = %selected.option_id, "permission ACP refusée");
-                        PermissionResult::Reject
-                    }
-                    unknown => PermissionResult::TransportError(format!("option de permission ACP inconnue: {unknown}")),
-                }
-            }
+            RequestPermissionOutcome::Selected(selected) => match selected.option_id.0.as_ref() {
+                "allow_once" | "allow_always" => PermissionResult::Allow,
+                "reject_once" | "reject_always" => PermissionResult::Reject,
+                unknown => PermissionResult::TransportError(format!("option de permission ACP inconnue: {unknown}")),
+            },
             _ => PermissionResult::TransportError("outcome de permission ACP non reconnu".into()),
         }
     }
 
-    fn emit_tool_call(&self, id: &ToolCallId, metadata: &ToolCallMetadata, status: ToolCallStatus, raw_input: &serde_json::Value) {
-        let _ = self.cx.send_notification(SessionNotification::new(
-            self.session_id.clone(),
-            SessionUpdate::ToolCall(
-                AcpToolCall::new(id.clone(), format!("{} {}", metadata.risk.emoji(), metadata.title))
-                    .kind(metadata.kind)
-                    .status(status)
-                    .raw_input(raw_input.clone()),
-            ),
-        ));
+    fn emit_tool_call(&self, call_id: &ToolCallId, info: &ToolInfo, status: ToolCallStatus, raw_input: &serde_json::Value) {
+        let tool = AcpToolCall::new(call_id.clone(), info.title.clone())
+            .kind(info.kind)
+            .status(status)
+            .content(info.content.clone())
+            .locations(info.locations.clone())
+            .raw_input(bounded_raw_input(raw_input));
+        let _ = self.cx.send_notification(SessionNotification::new(self.session_id.clone(), SessionUpdate::ToolCall(tool)));
     }
 
-    fn emit_tool_call_update_status(&self, id: &ToolCallId, status: ToolCallStatus) {
-        let _ = self.cx.send_notification(SessionNotification::new(
-            self.session_id.clone(),
-            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id.clone(), ToolCallUpdateFields::new().status(status))),
-        ));
+    fn emit_status(&self, call_id: &ToolCallId, status: ToolCallStatus) {
+        self.emit_update(call_id, status, vec![], vec![]);
     }
 
-    fn emit_tool_call_update_with_content(&self, id: &ToolCallId, status: ToolCallStatus, content: &str) {
-        let _ = self.cx.send_notification(SessionNotification::new(
-            self.session_id.clone(),
-            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                id.clone(),
-                ToolCallUpdateFields::new()
-                    .status(status)
-                    .content(vec![ToolCallContent::Content(Content::new(ContentBlock::Text(TextContent::new(content.to_string()))))]),
-            )),
-        ));
+    fn emit_update(&self, call_id: &ToolCallId, status: ToolCallStatus, content: Vec<ToolCallContent>, locations: Vec<agent_client_protocol::schema::v1::ToolCallLocation>) {
+        let update = ToolCallUpdate::new(
+            call_id.clone(),
+            ToolCallUpdateFields::new().status(status).content(content).locations(locations),
+        );
+        let _ = self.cx.send_notification(SessionNotification::new(self.session_id.clone(), SessionUpdate::ToolCallUpdate(update)));
     }
 
-    fn emit_tool_call_update_failed(&self, id: &ToolCallId, message: &str) {
-        self.emit_tool_call_update_with_content(id, ToolCallStatus::Failed, message);
+    fn emit_failed(&self, call_id: &ToolCallId, message: &str, args: &serde_json::Value, tool_name: &str) {
+        let rendered = result_update(tool_name, args, message, false, self.cwd, None);
+        self.emit_update(call_id, rendered.status, rendered.content, rendered.locations);
+    }
+}
+
+fn registry_result(result: RegistryToolResult) -> ToolResult {
+    match result {
+        RegistryToolResult::Ok(content) => ToolResult { content, is_ok: true },
+        RegistryToolResult::Err(content) => ToolResult { content, is_ok: false },
     }
 }
 
@@ -383,31 +382,6 @@ impl PermissionKind {
             PermissionKind::Network => "network",
         }
     }
-}
-
-fn arg_str<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
-    args.get(key).and_then(serde_json::Value::as_str)
-}
-
-fn truncate_path(path: &str, max_chars: usize) -> String {
-    if path.len() <= max_chars { return path.to_string(); }
-    let tail = path.rsplit('/').take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("/");
-    if tail.len() + 4 <= max_chars { format!(".../{tail}") } else { format!("...{}", &path[path.len().saturating_sub(max_chars.saturating_sub(3))..]) }
-}
-
-fn truncate_cmd(cmd: &str, max_chars: usize) -> String {
-    let line = cmd.lines().next().unwrap_or("");
-    if line.len() <= max_chars { line.to_string() } else { format!("{}...", line.chars().take(max_chars).collect::<String>()) }
-}
-
-fn format_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-    if bytes >= GB { format!("{:.1} GiB", bytes as f64 / GB as f64) }
-    else if bytes >= MB { format!("{:.1} MiB", bytes as f64 / MB as f64) }
-    else if bytes >= KB { format!("{:.1} KiB", bytes as f64 / KB as f64) }
-    else { format!("{} octets", bytes) }
 }
 
 pub fn safe_session_update(cx: &ConnectionTo<Client>, session_id: &SessionId, update: SessionUpdate) {
@@ -444,25 +418,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_kind_mapping() {
-        assert_eq!(ToolCallMetadata::build("file_read", &serde_json::json!({})).kind, ToolKind::Read);
-        assert_eq!(ToolCallMetadata::build("search", &serde_json::json!({})).kind, ToolKind::Read);
-        assert_eq!(ToolCallMetadata::build("file_write", &serde_json::json!({})).kind, ToolKind::Edit);
-        assert_eq!(ToolCallMetadata::build("shell_exec", &serde_json::json!({"command":"ls"})).kind, ToolKind::Execute);
-    }
-
-    #[test]
-    fn permission_request_write() {
-        let request = PermissionRequest::from_tool_call("file_write", &serde_json::json!({"path":"/tmp/test","content":"hello"}));
-        assert_eq!(request.kind, PermissionKind::Write);
-        assert!(!request.summary.is_empty());
-    }
-
-    #[test]
-    fn permission_request_execute() {
-        let request = PermissionRequest::from_tool_call("shell_exec", &serde_json::json!({"command":"ls -la"}));
-        assert_eq!(request.kind, PermissionKind::Execute);
-        assert_eq!(request.risk, RiskLevel::Low);
+    fn permission_kind_mapping() {
+        assert_eq!(PermissionKind::Write.label(), "write");
+        assert_eq!(PermissionKind::Execute.label(), "execute");
     }
 
     #[test]
