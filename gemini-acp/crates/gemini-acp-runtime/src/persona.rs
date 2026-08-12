@@ -14,20 +14,15 @@
 
 use crate::state::Session;
 
-/// Persona disponibles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Persona {
-    /// Assistant de codage pragmatique (défaut).
     #[default]
     Coding,
-    /// Mode créatif — réponses plus détaillées, analogies, explications.
     Creative,
-    /// Mode concis — réponses ultra-courtes, pas de blabla.
     Concise,
 }
 
 impl Persona {
-    /// Parse depuis une chaîne (insensible à la casse).
     pub fn from_str_lossy(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "coding" | "code" | "default" => Some(Persona::Coding),
@@ -37,13 +32,11 @@ impl Persona {
         }
     }
 
-    /// Liste des personas disponibles (pour la config option).
     pub fn all() -> &'static [Persona] {
         const ALL: &[Persona] = &[Persona::Coding, Persona::Creative, Persona::Concise];
         ALL
     }
 
-    /// Nom d'affichage.
     pub fn display_name(&self) -> &'static str {
         match self {
             Persona::Coding => "Coding assistant",
@@ -52,7 +45,6 @@ impl Persona {
         }
     }
 
-    /// Description courte.
     pub fn description(&self) -> &'static str {
         match self {
             Persona::Coding => "Pragmatic coding assistant for Zed. Markdown, executable code.",
@@ -61,91 +53,48 @@ impl Persona {
         }
     }
 
-    /// Instruction système spécifique à la persona.
     fn core_instruction(&self) -> &'static str {
         match self {
-            Persona::Coding => {
-                "\
+            Persona::Coding => "\
 Réponds en Markdown. Propose du code exécutable quand c'est pertinent. \
 Préfère les solutions directes et pragmatiques. \
-Si tu utilises un outil, explique brièvement ce que tu fais avant et après."
-            }
-            Persona::Creative => {
-                "\
+Si tu utilises un outil, explique brièvement ce que tu fais avant et après.",
+            Persona::Creative => "\
 Réponds en Markdown avec des explications détaillées. \
 Utilise des analogies et des exemples pour clarifier les concepts. \
 Propose plusieurs approches quand c'est pertinent. \
-Si tu utilises un outil, explique ta démarche en détail."
-            }
-            Persona::Concise => {
-                "\
+Si tu utilises un outil, explique ta démarche en détail.",
+            Persona::Concise => "\
 Réponds avec le minimum de texte. Pas d'explications sauf si demandé. \
 Code directement, sans préambule. \
-N'utilise les outils que si c'est strictement nécessaire."
-            }
+N'utilise les outils que si c'est strictement nécessaire.",
         }
     }
 
-    /// Constraints spécifiques à la persona (ajoutées à la fin du système).
     fn constraints(&self) -> &'static [&'static str] {
-        const CODING: &[&str] = &[
-            "Ne jamais inventer de fichiers ou de chemins qui n'existent pas.",
-            "Vérifie les erreurs de compilation si possible.",
-            "Préfère les bibliothèques standards du langage.",
-        ];
-        const CREATIVE: &[&str] = &[
-            "Structure les réponses longues avec des titres et sections.",
-            "Inclus des exemples concrets et des cas d'usage.",
-        ];
-        const CONCISE: &[&str] = &[
-            "Pas de salutations, pas de conclusions.",
-            "Code commenté uniquement pour les parties non évidentes.",
-        ];
-        match self {
-            Persona::Coding => CODING,
-            Persona::Creative => CREATIVE,
-            Persona::Concise => CONCISE,
-        }
+        const CODING: &[&str] = &["Ne jamais inventer de fichiers ou de chemins qui n'existent pas.", "Vérifie les erreurs de compilation si possible.", "Préfère les bibliothèques standards du langage."];
+        const CREATIVE: &[&str] = &["Structure les réponses longues avec des titres et sections.", "Inclus des exemples concrets et des cas d'usage."];
+        const CONCISE: &[&str] = &["Pas de salutations, pas de conclusions.", "Code commenté uniquement pour les parties non évidentes."];
+        match self { Persona::Coding => CODING, Persona::Creative => CREATIVE, Persona::Concise => CONCISE }
     }
 }
 
-/// Construit le prompt système complet en combinant :
-/// 1. L'en-tête fixe (identité de l'agent).
-/// 2. Le contexte (CWD, racines additionnelles).
-/// 3. L'instruction de persona.
-/// 4. Les contraintes.
-/// 5. Les directives de format de sortie.
 pub fn system_prompt(session: &Session, persona: Option<Persona>) -> String {
     let p = persona.unwrap_or_default();
     let mut system = String::with_capacity(1024);
-
-    system.push_str(&format!(
-        "[System instruction]: tu es un assistant {} intégré à Zed.\n",
-        p.display_name().to_ascii_lowercase()
-    ));
+    system.push_str(&format!("[System instruction]: tu es un assistant {} intégré à Zed.\n", p.display_name().to_ascii_lowercase()));
     system.push_str(&format!("CWD: {}\n", session.cwd.display()));
     if !session.additional_directories.is_empty() {
-        let roots = session
-            .additional_directories
-            .iter()
-            .map(|d| d.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let roots = session.additional_directories.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ");
         system.push_str(&format!("Racines additionnelles: {roots}\n"));
     }
     system.push_str(p.core_instruction());
     system.push_str("\n\n");
-    for constraint in p.constraints() {
-        system.push_str("- ");
-        system.push_str(constraint);
-        system.push('\n');
-    }
-    system.push_str(
-        "\
+    for constraint in p.constraints() { system.push_str("- "); system.push_str(constraint); system.push('\n'); }
+    system.push_str("\
 - Le code doit être complet et exécutable.\n\
 - Utilise les outils (file_read, file_write, shell_exec, search) pour explorer le projet.\n\
-- Quand tu modifies un fichier, affiche le chemin et les lignes changées.",
-    );
+- Quand tu modifies un fichier, affiche le chemin et les lignes changées.");
     system.push_str("\n\n");
     system
 }
