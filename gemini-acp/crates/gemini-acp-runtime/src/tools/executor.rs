@@ -1,16 +1,16 @@
-//! Tool execution and real ACP permission handling.
+//! Tool execution, ACP permissions, and rich tool-call UX.
 //!
-//! Permission requests are sent to the ACP client with `session/request_permission`.
-//! The old local oneshot/timeout broker intentionally does not exist anymore: in
-//! `default` mode a mutating tool is blocked until the client answers.
+//! The executor keeps the permission flow real (`session/request_permission`)
+//! while exposing the tool lifecycle in a form clients can render usefully:
+//! file locations, diffs for writes, concise titles, and bounded raw input.
 
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol::schema::v1::{
-    Content, ContentBlock, PermissionOption, PermissionOptionKind, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionId, SessionNotification, SessionUpdate, TextContent,
-    ToolCall as AcpToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind,
+    Content, ContentBlock, Diff, PermissionOption, PermissionOptionKind,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionId, SessionNotification,
+    SessionUpdate, TextContent, ToolCall as AcpToolCall, ToolCallContent, ToolCallId,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use agent_client_protocol::{Client, ConnectionTo};
 
@@ -18,66 +18,83 @@ use crate::state::SessionMode;
 use super::registry::ToolRegistry;
 use super::sandbox::{RiskLevel, ShellAnalysis, ShellSandbox};
 
-/// Human-readable metadata used both by tool_call notifications and permission UI.
+const MAX_RAW_INPUT_CHARS: usize = 8_192;
+const MAX_DIFF_OLD_TEXT_BYTES: u64 = 64 * 1024;
+
+/// Human-readable and structured metadata shared by tool-call creation and
+/// permission dialogs.
 #[derive(Debug, Clone)]
 pub struct ToolCallMetadata {
     pub title: String,
     pub description: String,
     pub risk: RiskLevel,
     pub kind: ToolKind,
+    pub content: Vec<ToolCallContent>,
+    pub locations: Vec<ToolCallLocation>,
 }
 
 impl ToolCallMetadata {
-    pub fn build(tool_name: &str, arguments: &serde_json::Value) -> Self {
+    pub fn build(tool_name: &str, arguments: &serde_json::Value, cwd: &Path) -> Self {
         match tool_name {
-            "file_read" => Self::file_read(arguments),
-            "file_write" => Self::file_write(arguments),
+            "file_read" => Self::file_read(arguments, cwd),
+            "file_write" => Self::file_write(arguments, cwd),
             "shell_exec" => Self::shell_exec(arguments),
-            "search" => Self::search(arguments),
+            "search" => Self::search(arguments, cwd),
             _ => Self {
                 title: tool_name.to_string(),
-                description: format!(
-                    "Outil : {}\nArguments : {}",
-                    tool_name,
-                    serde_json::to_string_pretty(arguments).unwrap_or_else(|_| arguments.to_string())
-                ),
+                description: concise_generic_description(tool_name, arguments),
                 risk: RiskLevel::Medium,
                 kind: ToolKind::Other,
+                content: vec![],
+                locations: vec![],
             },
         }
     }
 
-    fn file_read(args: &serde_json::Value) -> Self {
+    fn file_read(args: &serde_json::Value, cwd: &Path) -> Self {
         let path = arg_str(args, "path").unwrap_or("<path manquant>");
         let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(500);
-        let mut description = format!("Lecture du fichier : {}", path);
+        let display = display_path(path, cwd);
+        let mut description = format!("Lecture du fichier : {display}");
         if offset > 0 || limit < 500 {
             description.push_str(&format!(" (lignes {}..{}, max {})", offset, offset + limit, limit));
         }
-        if let Ok(metadata) = std::fs::metadata(path) {
+        if let Ok(metadata) = std::fs::metadata(resolve_path(path, cwd)) {
             description.push_str(&format!("\nTaille : {}", format_size(metadata.len())));
         }
         Self {
-            title: format!("Read: {}", truncate_path(path, 60)),
+            title: if offset > 0 {
+                format!("Read {display} @ {}", offset)
+            } else {
+                format!("Read {display}")
+            },
             description,
             risk: RiskLevel::Low,
             kind: ToolKind::Read,
+            content: vec![],
+            locations: vec![ToolCallLocation::new(resolve_path(path, cwd)).line(offset.max(1) as u32)],
         }
     }
 
-    fn file_write(args: &serde_json::Value) -> Self {
+    fn file_write(args: &serde_json::Value, cwd: &Path) -> Self {
         let path = arg_str(args, "path").unwrap_or("<path manquant>");
         let content = arg_str(args, "content").unwrap_or("");
-        let action = if std::fs::metadata(path).is_ok() { "Modification" } else { "Création" };
+        let resolved = resolve_path(path, cwd);
+        let display = display_path(path, cwd);
+        let action = if resolved.exists() { "Modification" } else { "Création" };
+        let old_text = read_old_text(&resolved);
+        let diff = Diff::new(resolved.clone(), content.to_string()).old_text(old_text);
         Self {
-            title: format!("Write: {}", truncate_path(path, 60)),
+            title: format!("Write {display}"),
             description: format!(
-                "{} du fichier : {}\nTaille : {} ({} octets)\nLignes : {}",
-                action, path, format_size(content.len() as u64), content.len(), content.lines().count()
+                "{action} du fichier : {display}\nTaille : {} ({} octets)\nLignes : {}",
+                format_size(content.len() as u64), content.len(), content.lines().count()
             ),
             risk: RiskLevel::Medium,
             kind: ToolKind::Edit,
+            content: vec![ToolCallContent::Diff(diff)],
+            locations: vec![ToolCallLocation::new(resolved)],
         }
     }
 
@@ -86,7 +103,7 @@ impl ToolCallMetadata {
         let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
         match ShellSandbox::new().analyze_command(command) {
             Ok(analysis) => Self {
-                title: format!("Exec: {}", truncate_cmd(command, 60)),
+                title: format!("Run {}", truncate_cmd(command, 72)),
                 description: format!(
                     "{}\nRisque : {} {}\nTimeout : {}s\n{}",
                     analysis.summary(), analysis.risk.emoji(), analysis.risk.label(), timeout,
@@ -94,25 +111,33 @@ impl ToolCallMetadata {
                 ),
                 risk: analysis.risk,
                 kind: ToolKind::Execute,
+                content: vec![],
+                locations: vec![],
             },
             Err(error) => Self {
-                title: format!("Exec: {}", truncate_cmd(command, 60)),
-                description: format!("Commande bloquée par la sandbox : {}\n{}", command, error),
+                title: format!("Run {}", truncate_cmd(command, 72)),
+                description: format!("Commande bloquée par la sandbox : {command}\n{error}"),
                 risk: RiskLevel::Critical,
                 kind: ToolKind::Execute,
+                content: vec![],
+                locations: vec![],
             },
         }
     }
 
-    fn search(args: &serde_json::Value) -> Self {
+    fn search(args: &serde_json::Value, cwd: &Path) -> Self {
         let pattern = arg_str(args, "pattern").unwrap_or("<pattern manquant>");
-        let path = arg_str(args, "path").unwrap_or("CWD");
+        let path = arg_str(args, "path").unwrap_or(".");
         let glob = arg_str(args, "glob").unwrap_or("all files");
+        let resolved = resolve_path(path, cwd);
+        let display = display_path(path, cwd);
         Self {
-            title: format!("Search: {}", truncate_cmd(pattern, 60)),
-            description: format!("Recherche : '{}' dans {}\nFiltre : {}", pattern, path, glob),
+            title: format!("Search '{}'{}", truncate_cmd(pattern, 56), if display == "." { String::new() } else { format!(" in {display}") }),
+            description: format!("Recherche : '{}' dans {}\nFiltre : {}", pattern, display, glob),
             risk: RiskLevel::Low,
             kind: ToolKind::Read,
+            content: vec![],
+            locations: vec![ToolCallLocation::new(resolved)],
         }
     }
 }
@@ -137,8 +162,8 @@ pub enum PermissionKind {
 }
 
 impl PermissionRequest {
-    pub fn from_tool_call(tool_name: &str, args: &serde_json::Value) -> Self {
-        let metadata = ToolCallMetadata::build(tool_name, args);
+    pub fn from_tool_call(tool_name: &str, args: &serde_json::Value, cwd: &Path) -> Self {
+        let metadata = ToolCallMetadata::build(tool_name, args, cwd);
         let kind = match tool_name {
             "file_read" | "search" => PermissionKind::Read,
             "file_write" => PermissionKind::Write,
@@ -148,8 +173,9 @@ impl PermissionRequest {
         match tool_name {
             "file_write" => {
                 if let Some(path) = arg_str(args, "path") {
-                    if std::fs::metadata(path).is_ok() {
-                        warnings.push(format!("Le fichier '{}' existe déjà et sera modifié.", path));
+                    let resolved = resolve_path(path, cwd);
+                    if resolved.exists() {
+                        warnings.push(format!("Le fichier '{}' existe déjà et sera modifié.", display_path(path, cwd)));
                     }
                 }
             }
@@ -234,7 +260,7 @@ impl<'a> ToolExecutor<'a> {
 
     pub async fn execute(&self, tool_name: &str, arguments: &serde_json::Value) -> ToolResult {
         let call_id = ToolCallId::from(format!("call_{}", uuid::Uuid::new_v4().simple()));
-        let metadata = ToolCallMetadata::build(tool_name, arguments);
+        let metadata = ToolCallMetadata::build(tool_name, arguments, self.cwd);
         let mode = (self.get_mode)();
         let needs_permission = match metadata.kind {
             ToolKind::Edit | ToolKind::Execute => !matches!(mode, SessionMode::BypassPermissions),
@@ -245,7 +271,7 @@ impl<'a> ToolExecutor<'a> {
         self.emit_tool_call(&call_id, &metadata, if needs_permission { ToolCallStatus::Pending } else { ToolCallStatus::InProgress }, arguments);
 
         if needs_permission {
-            let request = PermissionRequest::from_tool_call(tool_name, arguments);
+            let request = PermissionRequest::from_tool_call(tool_name, arguments, self.cwd);
             match self.request_permission(&call_id, &request).await {
                 PermissionResult::Allow => self.emit_tool_call_update_status(&call_id, ToolCallStatus::InProgress),
                 PermissionResult::Reject => {
@@ -282,10 +308,6 @@ impl<'a> ToolExecutor<'a> {
         }
     }
 
-    /// Send the standard ACP `session/request_permission` request and wait for the client's response.
-    ///
-    /// The request is made from the spawned prompt task, not from the ACP dispatch loop, so
-    /// `block_task()` is safe and does not deadlock the connection.
     pub async fn request_permission(&self, call_id: &ToolCallId, request: &PermissionRequest) -> PermissionResult {
         let tool_call = AcpToolCall::new(call_id.clone(), request.summary.clone())
             .kind(match request.kind {
@@ -321,32 +343,26 @@ impl<'a> ToolExecutor<'a> {
 
         match response.outcome {
             RequestPermissionOutcome::Cancelled => PermissionResult::Cancelled,
-            RequestPermissionOutcome::Selected(selected) => {
-                match selected.option_id.0.as_ref() {
-                    "allow_once" | "allow_always" => {
-                        tracing::info!(session = %self.session_id, tool = %request.tool_name, option = %selected.option_id, "permission ACP accordée");
-                        PermissionResult::Allow
-                    }
-                    "reject_once" | "reject_always" => {
-                        tracing::info!(session = %self.session_id, tool = %request.tool_name, option = %selected.option_id, "permission ACP refusée");
-                        PermissionResult::Reject
-                    }
-                    unknown => PermissionResult::TransportError(format!("option de permission ACP inconnue: {unknown}")),
-                }
-            }
+            RequestPermissionOutcome::Selected(selected) => match selected.option_id.0.as_ref() {
+                "allow_once" | "allow_always" => PermissionResult::Allow,
+                "reject_once" | "reject_always" => PermissionResult::Reject,
+                unknown => PermissionResult::TransportError(format!("option de permission ACP inconnue: {unknown}")),
+            },
             _ => PermissionResult::TransportError("outcome de permission ACP non reconnu".into()),
         }
     }
 
     fn emit_tool_call(&self, id: &ToolCallId, metadata: &ToolCallMetadata, status: ToolCallStatus, raw_input: &serde_json::Value) {
+        let safe_input = bounded_raw_input(raw_input);
+        let call = AcpToolCall::new(id.clone(), format!("{} {}", metadata.risk.emoji(), metadata.title))
+            .kind(metadata.kind)
+            .status(status)
+            .content(metadata.content.clone())
+            .locations(metadata.locations.clone())
+            .raw_input(safe_input);
         let _ = self.cx.send_notification(SessionNotification::new(
             self.session_id.clone(),
-            SessionUpdate::ToolCall(
-                AcpToolCall::new(id.clone(), format!("{} {}", metadata.risk.emoji(), metadata.title))
-                    .kind(metadata.kind)
-                    .status(status)
-                    .raw_input(raw_input.clone()),
-            ),
+            SessionUpdate::ToolCall(call),
         ));
     }
 
@@ -389,15 +405,55 @@ fn arg_str<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(serde_json::Value::as_str)
 }
 
-fn truncate_path(path: &str, max_chars: usize) -> String {
-    if path.len() <= max_chars { return path.to_string(); }
-    let tail = path.rsplit('/').take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("/");
-    if tail.len() + 4 <= max_chars { format!(".../{tail}") } else { format!("...{}", &path[path.len().saturating_sub(max_chars.saturating_sub(3))..]) }
+fn resolve_path(path: &str, cwd: &Path) -> PathBuf {
+    let candidate = PathBuf::from(path);
+    if candidate.is_absolute() { candidate } else { cwd.join(candidate) }
+}
+
+fn display_path(path: &str, cwd: &Path) -> String {
+    let resolved = resolve_path(path, cwd);
+    match resolved.strip_prefix(cwd) {
+        Ok(relative) if !relative.as_os_str().is_empty() => relative.display().to_string(),
+        Ok(_) => ".".into(),
+        Err(_) => path.to_string(),
+    }
+}
+
+fn read_old_text(path: &Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > MAX_DIFF_OLD_TEXT_BYTES { return None; }
+    std::fs::read_to_string(path).ok()
+}
+
+fn bounded_raw_input(input: &serde_json::Value) -> serde_json::Value {
+    let mut value = input.clone();
+    if let Some(object) = value.as_object_mut() {
+        if let Some(content) = object.get_mut("content").and_then(serde_json::Value::as_str) {
+            if content.chars().count() > MAX_RAW_INPUT_CHARS {
+                let preview: String = content.chars().take(MAX_RAW_INPUT_CHARS).collect();
+                *object.get_mut("content").expect("content exists") = serde_json::Value::String(format!(
+                    "{}\n… [{} chars omitted from ACP display]",
+                    preview,
+                    content.chars().count() - MAX_RAW_INPUT_CHARS
+                ));
+            }
+        }
+    }
+    value
+}
+
+fn concise_generic_description(tool_name: &str, args: &serde_json::Value) -> String {
+    let keys = args.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
+    if keys.is_empty() {
+        format!("Outil : {tool_name}")
+    } else {
+        format!("Outil : {tool_name}\nArguments : {}", keys.join(", "))
+    }
 }
 
 fn truncate_cmd(cmd: &str, max_chars: usize) -> String {
     let line = cmd.lines().next().unwrap_or("");
-    if line.len() <= max_chars { line.to_string() } else { format!("{}...", line.chars().take(max_chars).collect::<String>()) }
+    if line.chars().count() <= max_chars { line.to_string() } else { format!("{}…", line.chars().take(max_chars).collect::<String>()) }
 }
 
 fn format_size(bytes: u64) -> String {
@@ -424,8 +480,10 @@ pub fn emit_error_chunk(
         cx,
         session_id,
         SessionUpdate::AgentMessageChunk(
-            agent_client_protocol::schema::v1::ContentChunk::new(ContentBlock::Text(TextContent::new(format!("\n\n[error] {error}"))))
-                .message_id(message_id.clone()),
+            agent_client_protocol::schema::v1::ContentChunk::new(
+                ContentBlock::Text(TextContent::new(format!("\n\n[error] {error}"))),
+            )
+            .message_id(message_id.clone()),
         ),
     );
 }
@@ -445,24 +503,47 @@ mod tests {
 
     #[test]
     fn tool_kind_mapping() {
-        assert_eq!(ToolCallMetadata::build("file_read", &serde_json::json!({})).kind, ToolKind::Read);
-        assert_eq!(ToolCallMetadata::build("search", &serde_json::json!({})).kind, ToolKind::Read);
-        assert_eq!(ToolCallMetadata::build("file_write", &serde_json::json!({})).kind, ToolKind::Edit);
-        assert_eq!(ToolCallMetadata::build("shell_exec", &serde_json::json!({"command":"ls"})).kind, ToolKind::Execute);
+        let cwd = Path::new("/tmp/project");
+        assert_eq!(ToolCallMetadata::build("file_read", &serde_json::json!({"path":"src/main.rs"}), cwd).kind, ToolKind::Read);
+        assert_eq!(ToolCallMetadata::build("search", &serde_json::json!({"pattern":"TODO"}), cwd).kind, ToolKind::Read);
+        assert_eq!(ToolCallMetadata::build("file_write", &serde_json::json!({"path":"src/main.rs","content":"fn main() {}"}), cwd).kind, ToolKind::Edit);
+        assert_eq!(ToolCallMetadata::build("shell_exec", &serde_json::json!({"command":"ls"}), cwd).kind, ToolKind::Execute);
+    }
+
+    #[test]
+    fn file_write_exposes_diff_and_location() {
+        let cwd = Path::new("/tmp/project");
+        let metadata = ToolCallMetadata::build("file_write", &serde_json::json!({"path":"src/lib.rs","content":"hello"}), cwd);
+        assert!(matches!(metadata.content.first(), Some(ToolCallContent::Diff(_))));
+        assert_eq!(metadata.locations.len(), 1);
+        assert_eq!(metadata.title, "Write src/lib.rs");
+    }
+
+    #[test]
+    fn display_path_is_project_relative() {
+        let cwd = Path::new("/tmp/project");
+        assert_eq!(display_path("src/lib.rs", cwd), "src/lib.rs");
+        assert_eq!(display_path("/tmp/outside.rs", cwd), "/tmp/outside.rs");
+    }
+
+    #[test]
+    fn raw_input_is_bounded_for_large_writes() {
+        let input = serde_json::json!({"path":"x","content":"a".repeat(MAX_RAW_INPUT_CHARS + 32)});
+        let bounded = bounded_raw_input(&input);
+        let content = bounded.get("content").and_then(|v| v.as_str()).unwrap();
+        assert!(content.chars().count() < MAX_RAW_INPUT_CHARS + 64);
+        assert!(content.contains("chars omitted"));
     }
 
     #[test]
     fn permission_request_write() {
-        let request = PermissionRequest::from_tool_call("file_write", &serde_json::json!({"path":"/tmp/test","content":"hello"}));
+        let request = PermissionRequest::from_tool_call(
+            "file_write",
+            &serde_json::json!({"path":"/tmp/test","content":"hello"}),
+            Path::new("/tmp"),
+        );
         assert_eq!(request.kind, PermissionKind::Write);
         assert!(!request.summary.is_empty());
-    }
-
-    #[test]
-    fn permission_request_execute() {
-        let request = PermissionRequest::from_tool_call("shell_exec", &serde_json::json!({"command":"ls -la"}));
-        assert_eq!(request.kind, PermissionKind::Execute);
-        assert_eq!(request.risk, RiskLevel::Low);
     }
 
     #[test]
