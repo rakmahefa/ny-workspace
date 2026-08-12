@@ -9,14 +9,14 @@
 //! - [`prompt`]    : injection `# Tool Use` dans le prompt + formatage historique.
 //! - [`sandbox`]   : validation de sécurité (path traversal, shell sandbox).
 //! - [`builtin`]   : outils intégrés (file_read, file_write, shell_exec, search).
+//! - [`interactive`] : outils qui utilisent directement les capacités interactives ACP.
 
 pub mod builtin;
 pub mod executor;
+pub mod interactive;
 pub mod parse;
 pub mod prompt;
 pub mod registry;
 pub mod sandbox;
 
-// Re-exports pour usage pratique.
 pub use registry::ToolRegistry;
-
