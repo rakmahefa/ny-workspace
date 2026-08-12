@@ -1,0 +1,8 @@
+[
+  {
+    "name": "SAPISID",
+    "value": "REPLACE_WITH_YOUR_SESSION_COOKIE",
+    "domain": ".google.com",
+    "expirationDate": 0
+  }
+]

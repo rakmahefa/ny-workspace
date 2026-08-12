@@ -1,0 +1,28 @@
+[package]
+name = "gemini-acp-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Runtime agent ACP : état, outils, persistance sessions"
+
+[dependencies]
+gemini-acp-config = { path = "../gemini-acp-config" }
+agent-client-protocol = { workspace = true }
+# Non listé dans spec.md §4.3 (omission) mais requis par tools/sandbox.rs et
+# tools/parse.rs (regex statiques pour l'analyse shell / le parsing tool_call).
+regex = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }

@@ -1,0 +1,39 @@
+[package]
+name = "gemini-acp-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Agent ACP v1 pour Zed : transport, handlers, prompt"
+
+[[bin]]
+name = "gemini-acp"
+path = "src/bin/main.rs"
+
+[[bin]]
+name = "gemini-acp-snapshot"
+path = "src/bin/snapshot.rs"
+
+[dependencies]
+gemini-acp-config = { path = "../gemini-acp-config" }
+gemini-acp-runtime = { path = "../gemini-acp-runtime" }
+agent-client-protocol = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+regex = { workspace = true }
+async-trait = { workspace = true }
+
+[features]
+default = ["unstable_session_fork"]
+elicitation = ["agent-client-protocol/unstable_elicitation"]
+unstable_session_fork = ["agent-client-protocol/unstable_session_fork"]
+unstable_protocol_v2 = ["agent-client-protocol/unstable_protocol_v2"]
