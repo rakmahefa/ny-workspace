@@ -52,5 +52,5 @@ pub async fn notify_thought(cx: &ConnectionTo<Client>, session_id: &SessionId, m
 }
 
 #[cfg(test)]
-#[path = "../test/thought.rs"]
+#[path = "test/thought.rs"]
 mod tests;

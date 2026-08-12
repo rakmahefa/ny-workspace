@@ -35,5 +35,5 @@ impl AgentRuntime {
 }
 
 #[cfg(test)]
-#[path = "../test/runtime.rs"]
+#[path = "test/runtime.rs"]
 mod tests;

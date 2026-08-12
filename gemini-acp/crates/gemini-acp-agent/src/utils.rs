@@ -24,5 +24,5 @@ pub async fn sleep(duration: Duration) { tokio_sleep(duration).await }
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[cfg(test)]
-#[path = "../test/utils.rs"]
+#[path = "test/utils.rs"]
 mod tests;

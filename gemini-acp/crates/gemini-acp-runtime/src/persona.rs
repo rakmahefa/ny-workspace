@@ -100,5 +100,5 @@ pub fn system_prompt(session: &Session, persona: Option<Persona>) -> String {
 }
 
 #[cfg(test)]
-#[path = "../test/persona.rs"]
+#[path = "test/persona.rs"]
 mod tests;

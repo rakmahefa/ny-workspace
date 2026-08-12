@@ -30,5 +30,5 @@ impl SessionManager {
 }
 
 #[cfg(test)]
-#[path = "../test/session.rs"]
+#[path = "test/session.rs"]
 mod tests;
