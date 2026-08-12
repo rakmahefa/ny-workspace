@@ -58,7 +58,8 @@ impl SessionManager {
 
     pub fn sanitize_title(text: &str) -> Option<String> {
         let title = text
-            .replace(['\r', '\n'], " ")
+            .replace('\r', " ")
+            .replace('\n', " ")
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
@@ -69,7 +70,7 @@ impl SessionManager {
         let mut chars = title.chars();
         let truncated: String = chars.by_ref().take(MAX_TITLE_LENGTH).collect();
         if chars.next().is_some() {
-            let keep = MAX_TITLE_LENGTH.saturating_sub('…'.len_utf8());
+            let keep = MAX_TITLE_LENGTH.saturating_sub(1);
             Some(format!("{}…", truncated.chars().take(keep).collect::<String>()))
         } else {
             Some(truncated)
@@ -178,11 +179,6 @@ impl SessionManager {
         self.store.cancel(id).await;
         Ok(())
     }
-
-    #[cfg(test)]
-    pub fn new_for_test(store: Store) -> Self {
-        Self::new(Arc::new(store))
-    }
 }
 
 #[cfg(test)]
@@ -197,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_title_collapsse_et_tronque() {
+    fn sanitize_title_collabse_et_tronque() {
         assert_eq!(SessionManager::sanitize_title("  hello\n   world  ").as_deref(), Some("hello world"));
         let long = "a".repeat(MAX_TITLE_LENGTH + 40);
         let title = SessionManager::sanitize_title(&long).unwrap();
