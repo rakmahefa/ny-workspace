@@ -129,8 +129,8 @@ pub async fn run_agent(state: AppState) -> Result<(), AcpError> {
         .on_receive_request(
             {
                 let state = state.clone();
-                async move |req: ResumeSessionRequest, responder, _cx| {
-                    handlers::session::handle_resume(req, responder, &state).await
+                async move |req: ResumeSessionRequest, responder, cx| {
+                    handlers::session::handle_resume(req, responder, &state, &cx).await
                 }
             },
             agent_client_protocol::on_receive_request!(),

@@ -75,7 +75,7 @@ impl Store {
             if let Some(entry) = live.get(id) {
                 if entry.generation != expected_gen {
                     tracing::warn!(session = %id, expected_gen, current_gen = entry.generation, "end_turn: tour obsolète ignoré (état non persisté)");
-                    bail!("tour obsolète: generation attendue {expected_gen}, courante {}", entry.generation);
+                    bail!("tour obsolète: génération attendue {expected_gen}, courante {}", entry.generation);
                 }
             }
         }
@@ -100,31 +100,24 @@ impl Store {
         persist_result
     }
 
-    /// Annulation (`session/cancel`/`session/close`) : pose le jeton du tour courant et libère `busy`.
+    /// Annulation (`session/cancel`) : demande l'arrêt mais laisse le tour
+    /// propriétaire du verrou jusqu'à `end_turn`. Le tour peut ainsi persister
+    /// un état cohérent avant que la session redevienne disponible.
     pub async fn cancel(&self, id: &str) {
-        let needs_release = {
-            let mut live = self.live.write().await;
-            if let Some(entry) = live.get_mut(id) {
-                let _ = entry.cancel.send(true);
-                entry.busy = false;
-                entry.generation += 1;
-                true
-            } else { false }
-        };
-        if needs_release { self.release_busy(id).await; }
+        let mut live = self.live.write().await;
+        if let Some(entry) = live.get_mut(id) {
+            let _ = entry.cancel.send(true);
+        }
     }
 
-    /// Annule tous les tours en cours et libère les sentinelles `.busy`.
+    /// Annule tous les tours en cours. Les sentinelles `.busy` restent détenues
+    /// par les tours jusqu'à leur sortie, afin d'éviter un chevauchement avec un
+    /// nouveau prompt pendant que des tâches annulées sont encore vivantes.
     pub async fn cancel_all(&self) {
-        let ids: Vec<String> = {
-            let live = self.live.read().await;
-            for entry in live.values() { let _ = entry.cancel.send(true); }
-            live.keys().cloned().collect()
-        };
-        let mut live = self.live.write().await;
-        for id in &ids { if let Some(entry) = live.get_mut(id) { entry.busy = false; } }
-        drop(live);
-        for id in &ids { self.release_busy(id).await; }
+        let live = self.live.read().await;
+        for entry in live.values() {
+            let _ = entry.cancel.send(true);
+        }
     }
 
     /// Ferme la session : annule le travail en cours, retire de la mémoire et conserve le fichier.

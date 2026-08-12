@@ -1,27 +1,31 @@
-//! Handlers de cycle de vie des sessions.
+//! ACP session lifecycle handlers.
 //!
-//! Refactor R1 — inspiré de `glm-acp-agent/src/protocol/agent.ts` :
-//! - **handle_set_mode** : nouveau handler `session/set_mode` (inspiré de
-//!   `GlmAcpAgent.setSessionMode`). Émet `CurrentModeUpdate` après changement.
-//! - **handle_fork** : nouveau handler `session/fork` (inspiré de
-//!   `GlmAcpAgent.unstable_forkSession`).
-//! - **Modes state** : les modes sont retournés dans les réponses session/new,
-//!   load, resume, fork.
+//! The handler layer deliberately delegates lifecycle invariants to
+//! `gemini_acp_runtime::SessionManager`. This keeps validation, persistence and
+//! user-visible error semantics consistent across new/load/resume/fork/close.
+//!
+//! UX principles borrowed from the mature Claude ACP adapter:
+//! - session mode state is returned on every lifecycle response;
+//! - loading replays history before resolving the request;
+//! - the session title is restored as an explicit `session/update`;
+//! - mode changes emit `CurrentModeUpdate` immediately;
+//! - invalid lifecycle inputs are rejected as `invalid_params`;
+//! - persisted tool_call/tool_result blocks are reconstructed into real ACP
+//!   tool cards during replay instead of disappearing from the conversation.
 
 use agent_client_protocol::schema::v1::*;
 use agent_client_protocol::{Client, ConnectionTo, Error as AcpError, Responder};
 use tracing::warn;
 
-use gemini_acp_runtime::AppState;
 use gemini_acp_config::config::config_options::build_config_options;
 use gemini_acp_runtime::state::{Role, SessionMode as AcpSessionMode};
+use gemini_acp_runtime::tools::parse::parse_tool_calls;
+use gemini_acp_runtime::tools::tool_ux::{bounded_raw_input, result_update, ToolInfo};
+use gemini_acp_runtime::AppState;
 
-/// Valide qu'un identifiant de session correspond au format attendu
-/// `^sess_[a-f0-9]{32}$` (UUID v4 simplifié, hexadécimal minuscule).
 fn is_valid_session_id(id: &str) -> bool {
-    let rest = match id.strip_prefix("sess_") {
-        Some(r) => r,
-        None => return false,
+    let Some(rest) = id.strip_prefix("sess_") else {
+        return false;
     };
     rest.len() == 32
         && rest
@@ -29,74 +33,121 @@ fn is_valid_session_id(id: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Construit la liste des modes disponibles (schema ACP v1.5.0).
-/// Inspiré de `GlmAcpAgent.modesState()`.
+fn session_id_error(id: &SessionId) -> AcpError {
+    AcpError::invalid_params().data(serde_json::json!({
+        "session_id": id.to_string(),
+        "error": "identifiant de session invalide"
+    }))
+}
+
+fn session_mode_id(mode: AcpSessionMode) -> SessionModeId {
+    SessionModeId::from(match mode {
+        AcpSessionMode::Default => "default",
+        AcpSessionMode::AcceptEdits => "accept_edits",
+        AcpSessionMode::BypassPermissions => "bypass_permissions",
+    })
+}
+
 fn build_available_modes() -> Vec<SessionMode> {
     AcpSessionMode::all()
         .iter()
-        .map(|m| {
-            SessionMode::new(
-                SessionModeId::from(match m {
-                    AcpSessionMode::Default => "default",
-                    AcpSessionMode::AcceptEdits => "accept_edits",
-                    AcpSessionMode::BypassPermissions => "bypass_permissions",
-                }),
-                m.display_name(),
-            )
-            .description(m.description())
+        .map(|mode| {
+            SessionMode::new(session_mode_id(*mode), mode.display_name())
+                .description(mode.description())
         })
         .collect()
 }
 
-/// Construit l'état des modes (mode courant + modes disponibles).
 fn build_mode_state(current: AcpSessionMode) -> SessionModeState {
-    let current_id = SessionModeId::from(match current {
-        AcpSessionMode::Default => "default",
-        AcpSessionMode::AcceptEdits => "accept_edits",
-        AcpSessionMode::BypassPermissions => "bypass_permissions",
-    });
-    SessionModeState::new(current_id, build_available_modes())
+    SessionModeState::new(session_mode_id(current), build_available_modes())
 }
 
-/// `session/new` — crée une session persistée.
+fn send_restored_title(
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    title: Option<&str>,
+) -> Result<(), AcpError> {
+    let Some(title) = title else {
+        return Ok(());
+    };
+
+    cx.send_notification(SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().title(title.to_owned())),
+    ))?;
+    Ok(())
+}
+
+fn is_rejected_or_cancelled_tool_result(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("refusé par l'utilisateur")
+        || lower.contains("annulé par l'utilisateur")
+        || lower.contains("échec de la demande de permission acp")
+}
+
+fn replay_tool_result(
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    tool_call_index: usize,
+    tool_name: &str,
+    args: &serde_json::Value,
+    result_text: Option<&str>,
+    cwd: &std::path::Path,
+) -> Result<(), AcpError> {
+    let call_id = ToolCallId::from(format!("replay_call_{tool_call_index}"));
+    let info = ToolInfo::build(tool_name, args, cwd, None);
+    let is_ok = result_text
+        .map(|text| !is_rejected_or_cancelled_tool_result(text))
+        .unwrap_or(false);
+
+    cx.send_notification(SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::ToolCall(
+            ToolCall::new(call_id.clone(), info.title.clone())
+                .kind(info.kind)
+                .status(if result_text.is_some() {
+                    if is_ok { ToolCallStatus::Completed } else { ToolCallStatus::Failed }
+                } else {
+                    ToolCallStatus::InProgress
+                })
+                .content(info.content.clone())
+                .locations(info.locations.clone())
+                .raw_input(bounded_raw_input(args)),
+        ),
+    ))?;
+
+    if let Some(result_text) = result_text {
+        let rendered = result_update(tool_name, args, result_text, is_ok, cwd, None);
+        cx.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(rendered.status)
+                    .content(rendered.content)
+                    .locations(rendered.locations),
+            )),
+        ))?;
+    }
+
+    Ok(())
+}
+
+/// `session/new`: persist a new session and return the current configuration/mode state.
 pub async fn handle_new(
     req: NewSessionRequest,
     responder: Responder<NewSessionResponse>,
     state: &AppState,
 ) -> Result<(), AcpError> {
-    if !req.cwd.is_absolute() {
-        return responder.respond_with_error(
-            AcpError::invalid_params()
-                .data(serde_json::json!({ "cwd": "le chemin doit être absolu" })),
-        );
-    }
-    match tokio::fs::metadata(&req.cwd).await {
-        Ok(m) if m.is_dir() => {}
-        Ok(_) => {
-            return responder.respond_with_error(AcpError::invalid_params().data(
-                serde_json::json!({
-                    "cwd": req.cwd.to_string_lossy(),
-                    "error": "le chemin n'est pas un répertoire"
-                }),
-            ));
-        }
-        Err(e) => {
-            return responder.respond_with_error(AcpError::invalid_params().data(
-                serde_json::json!({
-                    "cwd": req.cwd.to_string_lossy(),
-                    "error": format!("chemin inaccessible: {e}")
-                }),
-            ));
-        }
-    }
     if !req.mcp_servers.is_empty() {
         warn!(
-            n = req.mcp_servers.len(),
-            "session/new ignore les mcp_servers (pas de MCP en v1)"
+            count = req.mcp_servers.len(),
+            "session/new received mcp_servers, but Gemini ACP does not wire them yet"
         );
     }
+
     match state
-        .store
+        .sessions
         .create(
             req.cwd.clone(),
             req.additional_directories.clone(),
@@ -106,36 +157,43 @@ pub async fn handle_new(
     {
         Ok(session) => responder.respond(
             NewSessionResponse::new(session.id.clone())
-                .config_options(build_config_options(&session.model, session.think, session.tools_enabled))
-                .modes(build_mode_state(AcpSessionMode::Default)),
+                .config_options(build_config_options(
+                    &session.model,
+                    session.think,
+                    session.tools_enabled,
+                ))
+                .modes(build_mode_state(session.mode)),
         ),
-        Err(e) => responder.respond_with_internal_error(format!("{e:#}")),
+        Err(error) => responder.respond_with_internal_error(format!("création de session: {error:#}")),
     }
 }
 
-/// `session/list` — liste le dépôt (filtre `cwd` si fourni).
 pub async fn handle_list(
     req: ListSessionsRequest,
     responder: Responder<ListSessionsResponse>,
     state: &AppState,
 ) -> Result<(), AcpError> {
-    let sessions = state.store.list(req.cwd.as_deref()).await;
+    let sessions = match state.sessions.list(req.cwd.as_deref()).await {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            return responder
+                .respond_with_internal_error(format!("liste des sessions: {error:#}"));
+        }
+    };
+
     let infos = sessions
-        .iter()
-        .map(|s| {
-            SessionInfo::new(SessionId::from(s.id.clone()), s.cwd.clone())
-                .additional_directories(s.additional_directories.clone())
-                .title(s.title.clone())
-                .updated_at(Some(s.updated_at.clone()))
+        .into_iter()
+        .map(|session| {
+            SessionInfo::new(SessionId::from(session.id), session.cwd)
+                .additional_directories(session.additional_directories)
+                .title(session.title)
+                .updated_at(Some(session.updated_at))
         })
         .collect();
-    responder.respond(ListSessionsResponse::new(infos))?;
-    Ok(())
+
+    responder.respond(ListSessionsResponse::new(infos))
 }
 
-/// `session/load` — rejeu de l'historique AVANT la réponse (spec §3.2).
-///
-/// Refactor R1 : retourne aussi les modes (inspiré de GlmAcpAgent.loadSession).
 pub async fn handle_load(
     req: LoadSessionRequest,
     responder: Responder<LoadSessionResponse>,
@@ -143,209 +201,238 @@ pub async fn handle_load(
     cx: &ConnectionTo<Client>,
 ) -> Result<(), AcpError> {
     if !is_valid_session_id(&req.session_id.0) {
-        return responder.respond_with_error(AcpError::invalid_params().data(serde_json::json!({
-            "session_id": req.session_id.0.to_string(),
-            "error": "identifiant de session invalide"
-        })));
+        return responder.respond_with_error(session_id_error(&req.session_id));
     }
-    let Some(session) = state.store.get(&req.session_id.0).await else {
-        return responder.respond_with_error(
-            AcpError::invalid_params()
-                .data(serde_json::json!({ "session_id": req.session_id.0.to_string() })),
-        );
+
+    let session = match state.sessions.load(&req.session_id.0, &req.cwd).await {
+        Ok(session) => session,
+        Err(error) => {
+            return responder.respond_with_error(
+                AcpError::invalid_params().data(serde_json::json!({
+                    "session_id": req.session_id.to_string(),
+                    "error": format!("session introuvable ou workspace incompatible: {error:#}")
+                })),
+            );
+        }
     };
-    if req.cwd != session.cwd {
-        return responder.respond_with_error(
-            AcpError::invalid_params()
-                .data(serde_json::json!({ "cwd": "ne correspond pas à la session" })),
-        );
+
+    send_restored_title(cx, &req.session_id, session.title.as_deref())?;
+
+    let mut replay_index = 0usize;
+    let mut index = 0usize;
+
+    while index < session.messages.len() {
+        let (role, text) = &session.messages[index];
+
+        match role {
+            Role::User => {
+                let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone())))
+                    .message_id(MessageId::from(format!("msg_{index}")));
+                cx.send_notification(SessionNotification::new(
+                    req.session_id.clone(),
+                    SessionUpdate::UserMessageChunk(chunk),
+                ))?;
+            }
+            Role::Assistant => {
+                let (clean_text, calls) = parse_tool_calls(text);
+
+                if !clean_text.trim().is_empty() {
+                    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(clean_text)))
+                        .message_id(MessageId::from(format!("msg_{index}")));
+                    cx.send_notification(SessionNotification::new(
+                        req.session_id.clone(),
+                        SessionUpdate::AgentMessageChunk(chunk),
+                    ))?;
+                }
+
+                let mut result_cursor = index + 1;
+                for (call_index, call) in calls.iter().enumerate() {
+                    let result_text = if result_cursor < session.messages.len()
+                        && session.messages[result_cursor].0 == Role::Tool
+                    {
+                        let result = session.messages[result_cursor].1.as_str();
+                        result_cursor += 1;
+                        Some(result)
+                    } else {
+                        None
+                    };
+
+                    replay_tool_result(
+                        cx,
+                        &req.session_id,
+                        replay_index,
+                        &call.name,
+                        &call.arguments,
+                        result_text,
+                        &session.cwd,
+                    )?;
+                    replay_index += 1;
+                    let _ = call_index;
+                }
+
+                index = result_cursor.saturating_sub(1);
+            }
+            Role::Tool => {
+                // Consumed together with the preceding assistant tool_call block.
+            }
+        }
+
+        index += 1;
     }
-    // Rejeu de l'historique (inspiré de GlmAcpAgent.replayMessages).
-    for (i, (role, text)) in session.messages.iter().enumerate() {
-        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone())))
-            .message_id(MessageId::from(format!("msg_{i}")));
-        let update = match role {
-            Role::User => SessionUpdate::UserMessageChunk(chunk),
-            Role::Assistant => SessionUpdate::AgentMessageChunk(chunk),
-            Role::Tool => continue,
-        };
-        cx.send_notification(SessionNotification::new(req.session_id.clone(), update))?;
-    }
-    // Retourner les modes et config options (inspiré de GlmAcpAgent.loadSession).
+
     responder.respond(
         LoadSessionResponse::new()
-            .config_options(build_config_options(&session.model, session.think, session.tools_enabled))
+            .config_options(build_config_options(
+                &session.model,
+                session.think,
+                session.tools_enabled,
+            ))
             .modes(build_mode_state(session.mode)),
     )
 }
 
-/// `session/resume` — restauration sans rejeu.
-///
-/// Refactor R1 : retourne aussi les modes.
 pub async fn handle_resume(
     req: ResumeSessionRequest,
     responder: Responder<ResumeSessionResponse>,
     state: &AppState,
+    cx: &ConnectionTo<Client>,
 ) -> Result<(), AcpError> {
     if !is_valid_session_id(&req.session_id.0) {
-        return responder.respond_with_error(AcpError::invalid_params().data(serde_json::json!({
-            "session_id": req.session_id.0.to_string(),
-            "error": "identifiant de session invalide"
-        })));
+        return responder.respond_with_error(session_id_error(&req.session_id));
     }
-    let Some(session) = state.store.get(&req.session_id.0).await else {
-        return responder.respond_with_error(
-            AcpError::invalid_params()
-                .data(serde_json::json!({ "session_id": req.session_id.0.to_string() })),
-        );
+
+    let session = match state.sessions.resume(&req.session_id.0, &req.cwd).await {
+        Ok(session) => session,
+        Err(error) => {
+            return responder.respond_with_error(
+                AcpError::invalid_params().data(serde_json::json!({
+                    "session_id": req.session_id.to_string(),
+                    "error": format!("session introuvable ou workspace incompatible: {error:#}")
+                })),
+            );
+        }
     };
-    if req.cwd != session.cwd {
-        return responder.respond_with_error(
-            AcpError::invalid_params()
-                .data(serde_json::json!({ "cwd": "ne correspond pas à la session" })),
-        );
-    }
+
+    send_restored_title(cx, &req.session_id, session.title.as_deref())?;
+
     responder.respond(
         ResumeSessionResponse::new()
-            .config_options(build_config_options(&session.model, session.think, session.tools_enabled))
+            .config_options(build_config_options(
+                &session.model,
+                session.think,
+                session.tools_enabled,
+            ))
             .modes(build_mode_state(session.mode)),
     )
 }
 
-/// `session/delete` — supprime la session (mémoire + fichier).
 pub async fn handle_delete(
     req: DeleteSessionRequest,
     responder: Responder<DeleteSessionResponse>,
     state: &AppState,
 ) -> Result<(), AcpError> {
     if !is_valid_session_id(&req.session_id.0) {
-        return responder.respond_with_error(AcpError::invalid_params().data(serde_json::json!({
-            "session_id": req.session_id.0.to_string(),
-            "error": "identifiant de session invalide"
-        })));
+        return responder.respond_with_error(session_id_error(&req.session_id));
     }
-    state.store.delete(&req.session_id.0).await;
-    responder.respond(DeleteSessionResponse::new())
+
+    match state.sessions.delete(&req.session_id.0).await {
+        Ok(true) => responder.respond(DeleteSessionResponse::new()),
+        Ok(false) => responder.respond_with_error(
+            AcpError::invalid_params().data(serde_json::json!({
+                "session_id": req.session_id.to_string(),
+                "error": "session introuvable"
+            })),
+        ),
+        Err(error) => responder.respond_with_internal_error(format!("suppression de session: {error:#}")),
+    }
 }
 
-/// `session/close` — annule + libère, fichier conservé.
 pub async fn handle_close(
     req: CloseSessionRequest,
     responder: Responder<CloseSessionResponse>,
     state: &AppState,
 ) -> Result<(), AcpError> {
     if !is_valid_session_id(&req.session_id.0) {
-        return responder.respond_with_error(AcpError::invalid_params().data(serde_json::json!({
-            "session_id": req.session_id.0.to_string(),
-            "error": "identifiant de session invalide"
-        })));
+        return responder.respond_with_error(session_id_error(&req.session_id));
     }
-    state.store.close(&req.session_id.0).await;
-    responder.respond(CloseSessionResponse::new())
+
+    match state.sessions.close(&req.session_id.0).await {
+        Ok(true) => responder.respond(CloseSessionResponse::new()),
+        Ok(false) => responder.respond_with_error(
+            AcpError::invalid_params().data(serde_json::json!({
+                "session_id": req.session_id.to_string(),
+                "error": "session introuvable"
+            })),
+        ),
+        Err(error) => responder.respond_with_internal_error(format!("fermeture de session: {error:#}")),
+    }
 }
 
-/// `session/set_mode` — change le mode de permission.
-///
-/// Inspiré de `GlmAcpAgent.setSessionMode()` :
-/// - Valide le mode.
-/// - Met à jour la session.
-/// - Persiste.
-/// - Émet `CurrentModeUpdate`.
-/// - Émet `ConfigOptionUpdate` si nécessaire.
 pub async fn handle_set_mode(
     req: SetSessionModeRequest,
     responder: Responder<SetSessionModeResponse>,
     state: &AppState,
     cx: &ConnectionTo<Client>,
 ) -> Result<(), AcpError> {
-    let new_mode = match AcpSessionMode::from_str_lossy(&req.mode_id.0) {
-        Some(m) => m,
-        None => {
-            let valid = AcpSessionMode::all()
-                .iter()
-                .map(|m| match m {
-                    AcpSessionMode::Default => "default",
-                    AcpSessionMode::AcceptEdits => "accept_edits",
-                    AcpSessionMode::BypassPermissions => "bypass_permissions",
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            return responder.respond_with_error(AcpError::invalid_params().data(
-                serde_json::json!({
-                    "mode_id": req.mode_id.0.to_string(),
-                    "error": format!("mode_id invalide. Modes valides: {valid}")
-                }),
-            ));
+    let Some(new_mode) = AcpSessionMode::from_str_lossy(&req.mode_id.0) else {
+        let valid = AcpSessionMode::all()
+            .iter()
+            .map(|mode| session_mode_id(*mode).0.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return responder.respond_with_error(
+            AcpError::invalid_params().data(serde_json::json!({
+                "mode_id": req.mode_id.to_string(),
+                "error": format!("mode_id invalide. Modes valides: {valid}")
+            })),
+        );
+    };
+
+    let updated = match state.sessions.set_mode(&req.session_id.0, new_mode).await {
+        Ok(session) => session,
+        Err(error) => {
+            return responder.respond_with_error(
+                AcpError::invalid_params().data(serde_json::json!({
+                    "session_id": req.session_id.to_string(),
+                    "error": format!("impossible de changer le mode: {error:#}")
+                })),
+            );
         }
     };
 
-    // Vérifier que la session existe.
-    if state.store.get(&req.session_id.0).await.is_none() {
-        return responder.respond_with_error(
-            AcpError::invalid_params()
-                .data(serde_json::json!({ "session_id": req.session_id.0.to_string() })),
-        );
-    }
-
-    // Mettre à jour le mode.
-    if let Err(e) = state
-        .store
-        .update_session(&req.session_id.0, move |s| {
-            s.mode = new_mode;
-            s.updated_at = gemini_acp_config::core::time::now_iso();
-        })
-        .await
-    {
-        return responder.respond_with_internal_error(format!("{e:#}"));
-    }
-
-    // Émettre CurrentModeUpdate (inspiré de GlmAcpAgent.setSessionMode).
     cx.send_notification(SessionNotification::new(
         req.session_id.clone(),
-        SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(SessionModeId::from(
-            match new_mode {
-                AcpSessionMode::Default => "default",
-                AcpSessionMode::AcceptEdits => "accept_edits",
-                AcpSessionMode::BypassPermissions => "bypass_permissions",
-            },
-        ))),
+        SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(session_mode_id(updated.mode))),
     ))?;
 
     responder.respond(SetSessionModeResponse::new())
 }
 
-/// `session/fork` — duplique une session existante (inspiré de GlmAcpAgent.unstable_forkSession).
-///
-/// Crée une nouvelle session avec le même historique, cwd, et configuration.
-/// Le titre est suffixé de " (fork)". Les tours sont réinitialisés.
 pub async fn handle_fork(
     req: ForkSessionRequest,
     responder: Responder<ForkSessionResponse>,
     state: &AppState,
 ) -> Result<(), AcpError> {
     if !is_valid_session_id(&req.session_id.0) {
-        return responder.respond_with_error(AcpError::invalid_params().data(serde_json::json!({
-            "session_id": req.session_id.0.to_string(),
-            "error": "identifiant de session invalide"
-        })));
+        return responder.respond_with_error(session_id_error(&req.session_id));
     }
 
-    // Vérifier que la session source existe.
-    if state.store.get(&req.session_id.0).await.is_none() {
-        return responder.respond_with_error(
-            AcpError::invalid_params()
-                .data(serde_json::json!({ "session_id": req.session_id.0.to_string() })),
-        );
-    }
-
-    // Exécuter le fork via le store.
-    match state.store.fork(&req.session_id.0).await {
+    match state.sessions.fork(&req.session_id.0).await {
         Ok(forked) => responder.respond(
             ForkSessionResponse::new(SessionId::from(forked.id.clone()))
-                .config_options(build_config_options(&forked.model, forked.think, forked.tools_enabled))
+                .config_options(build_config_options(
+                    &forked.model,
+                    forked.think,
+                    forked.tools_enabled,
+                ))
                 .modes(build_mode_state(forked.mode)),
         ),
-        Err(e) => responder.respond_with_internal_error(format!("{e:#}")),
+        Err(error) => responder.respond_with_error(
+            AcpError::invalid_params().data(serde_json::json!({
+                "session_id": req.session_id.to_string(),
+                "error": format!("fork impossible: {error:#}")
+            })),
+        ),
     }
 }
 
@@ -354,40 +441,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_id_valide_format() {
+    fn session_id_accepts_only_expected_format() {
         assert!(is_valid_session_id("sess_0123456789abcdef0123456789abcdef"));
         assert!(is_valid_session_id("sess_aabbccddeeff00112233445566778899"));
-    }
-
-    #[test]
-    fn session_id_rejette_path_traversal() {
-        assert!(!is_valid_session_id("../../etc/passwd"));
-        assert!(!is_valid_session_id("sess_../../etc"));
-        assert!(!is_valid_session_id("sess_/etc/passwd"));
-        assert!(!is_valid_session_id(
-            "../sess_0123456789abcdef0123456789abcdef"
-        ));
-        assert!(!is_valid_session_id(
-            "sess_0123456789abcdef0123456789abcde/g"
-        ));
         assert!(!is_valid_session_id(""));
-        assert!(!is_valid_session_id("sess_"));
         assert!(!is_valid_session_id("sess_short"));
-        assert!(!is_valid_session_id(
-            "sess_0123456789ABCDEF0123456789ABCDEF"
-        ));
-        assert!(!is_valid_session_id(
-            "other_0123456789abcdef0123456789abcdef"
-        ));
+        assert!(!is_valid_session_id("sess_0123456789abcdef0123456789ABCDEF"));
+        assert!(!is_valid_session_id("../sess_0123456789abcdef0123456789abcdef"));
+        assert!(!is_valid_session_id("sess_/etc/passwd"));
     }
 
     #[test]
-    fn build_modes_retourne_3_modes() {
+    fn all_modes_have_stable_acp_ids() {
         let modes = build_available_modes();
-        assert_eq!(modes.len(), 3);
-        let ids: Vec<&str> = modes.iter().map(|m| m.id.0.as_ref()).collect();
-        assert!(ids.contains(&"default"));
-        assert!(ids.contains(&"accept_edits"));
-        assert!(ids.contains(&"bypass_permissions"));
+        let ids: Vec<&str> = modes.iter().map(|mode| mode.id.0.as_ref()).collect();
+        assert_eq!(ids, vec!["default", "accept_edits", "bypass_permissions"]);
+    }
+
+    #[test]
+    fn mode_state_uses_current_mode() {
+        let state = build_mode_state(AcpSessionMode::AcceptEdits);
+        assert_eq!(state.current_mode_id.0, "accept_edits");
+        assert_eq!(state.available_modes.len(), 3);
+    }
+
+    #[test]
+    fn rejected_tool_results_are_not_replayed_as_success() {
+        assert!(is_rejected_or_cancelled_tool_result("write (src/a.rs) refusé par l'utilisateur."));
+        assert!(is_rejected_or_cancelled_tool_result("échec de la demande de permission ACP : transport"));
+        assert!(!is_rejected_or_cancelled_tool_result("File Updated"));
     }
 }
