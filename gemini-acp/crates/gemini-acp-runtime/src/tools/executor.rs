@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol::schema::v1::{
-    Content, ContentBlock, CreateTerminalRequest, PermissionOption, PermissionOptionKind,
+    ContentBlock, CreateTerminalRequest, PermissionOption, PermissionOptionKind,
     ReleaseTerminalRequest, RequestPermissionOutcome, RequestPermissionRequest, SessionId,
     SessionNotification, SessionUpdate, Terminal, TerminalOutputRequest, TextContent,
     ToolCall as AcpToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
@@ -274,7 +274,9 @@ impl<'a> ToolExecutor<'a> {
             .await?;
 
         let output = output_response.output;
-        let exit_code = wait_response.exit_status.as_ref().and_then(|status| status.exit_code);
+        let exit_code = wait_response.exit_status.exit_code;
+        let signal = wait_response.exit_status.signal;
+
         let is_ok = exit_code.unwrap_or(0) == 0;
 
         let _ = self
