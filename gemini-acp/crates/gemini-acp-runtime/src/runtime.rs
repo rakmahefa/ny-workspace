@@ -68,7 +68,12 @@ impl AgentRuntime {
             .await
             .context("initialisation du SettingsManager")?;
 
-        let tools = Arc::new(ToolRegistry::builtin());
+        let mut tools = ToolRegistry::builtin();
+        // AskUserQuestion est un builtin du runtime, mais son exécution est
+        // reliée au client ACP via un contexte task-local installé par
+        // `gemini-acp-agent` pour chaque tour.
+        tools.register(Box::new(crate::tools::interactive::AskUserQuestionTool));
+        let tools = Arc::new(tools);
 
         Ok(Self {
             state: AppState {
@@ -131,6 +136,8 @@ mod tests {
         let runtime = AgentRuntime::from_config(config).await.expect("runtime");
         assert!(runtime.state().store.list(None).await.is_empty());
         assert!(runtime.settings().await.is_object());
+        let names = runtime.state().tools.definitions();
+        assert!(names.iter().any(|tool| tool["name"] == "AskUserQuestion"));
         runtime.shutdown().await;
     }
 
