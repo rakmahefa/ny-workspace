@@ -12,9 +12,8 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, CreateElicitationRequest, CreateElicitationResponse, ElicitationAction,
-    ElicitationContentValue, ElicitationFormMode, ElicitationPropertySchema, ElicitationSchema,
-    ElicitationSessionScope, SessionId,
+    CreateElicitationRequest, ElicitationAction, ElicitationContentValue, ElicitationFormMode,
+    ElicitationPropertySchema, ElicitationSchema, ElicitationSessionScope, SessionId,
 };
 use agent_client_protocol::{Client, ConnectionTo};
 use serde::Deserialize;
@@ -40,7 +39,7 @@ where
 }
 
 fn current_context() -> Option<InteractiveContext> {
-    CONTEXT.try_with(Clone::clone).ok()
+    CONTEXT.try_with(|context| context.clone()).ok()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -280,5 +279,58 @@ fn content_value_to_json(value: &ElicitationContentValue) -> Value {
         ElicitationContentValue::Number(value) => json!(value),
         ElicitationContentValue::StringArray(values) => json!(values),
         _ => Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn questions() -> Vec<AskUserQuestion> {
+        vec![AskUserQuestion {
+            question: "Quel langage ?".to_string(),
+            header: Some("Langage".to_string()),
+            multi_select: false,
+            options: vec![
+                AskUserOption {
+                    label: "Rust".to_string(),
+                    description: Some("Sûr et rapide".to_string()),
+                    preview: Some("fn main() {}".to_string()),
+                },
+                AskUserOption {
+                    label: "Python".to_string(),
+                    description: None,
+                    preview: None,
+                },
+            ],
+        }]
+    }
+
+    #[test]
+    fn builds_typed_form_properties() {
+        let properties = build_question_properties(&questions()).expect("schema");
+        assert_eq!(properties.len(), 2);
+    }
+
+    #[test]
+    fn custom_answer_takes_precedence() {
+        let content = BTreeMap::from([
+            (
+                "question_0".to_string(),
+                ElicitationContentValue::String("Rust".to_string()),
+            ),
+            (
+                "question_0_custom".to_string(),
+                ElicitationContentValue::String("  Go  ".to_string()),
+            ),
+        ]);
+        let answers = fold_answers(content, &questions());
+        assert_eq!(answers["Quel langage ?"], "Go");
+    }
+
+    #[test]
+    fn decline_is_serialized_as_empty_answers() {
+        let value = json!({"answers": {}}).to_string();
+        assert_eq!(value, "{\"answers\":{}}");
     }
 }
