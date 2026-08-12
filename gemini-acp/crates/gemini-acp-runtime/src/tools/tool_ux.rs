@@ -260,7 +260,7 @@ fn generic(name: &str, args: &serde_json::Value) -> ToolInfo {
     ToolInfo {
         title: name.to_owned(),
         kind: agent_client_protocol::schema::v1::ToolKind::Other,
-        content: if args.as_object().map_or(true, |obj| obj.is_empty()) {
+        content: if args.as_object().is_none_or(|obj| obj.is_empty()) {
             vec![]
         } else {
             vec![ToolCallContent::Content(Content::new(ContentBlock::Text(

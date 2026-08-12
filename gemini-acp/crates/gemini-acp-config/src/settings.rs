@@ -8,16 +8,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::{Map, Value};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 const DEBOUNCE: Duration = Duration::from_millis(100);
 
+#[derive(Default)]
 pub struct SettingsManagerOptions {
     pub on_change: Option<Arc<dyn Fn() + Send + Sync>>,
-}
-
-impl Default for SettingsManagerOptions {
-    fn default() -> Self { Self { on_change: None } }
 }
 
 pub struct SettingsManager {
@@ -25,7 +22,8 @@ pub struct SettingsManager {
     effective: Arc<Mutex<Value>>,
     watcher: Option<RecommendedWatcher>,
     reload_signal: Arc<Notify>,
-    shutdown: Arc<Notify>,
+    shutdown_tx: Option<watch::Sender<bool>>,
+    shutdown_rx: Option<watch::Receiver<bool>>,
     reload_task: Option<tokio::task::JoinHandle<()>>,
     on_change: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -37,7 +35,8 @@ impl SettingsManager {
             effective: Arc::new(Mutex::new(Value::Object(Map::new()))),
             watcher: None,
             reload_signal: Arc::new(Notify::new()),
-            shutdown: Arc::new(Notify::new()),
+            shutdown_tx: None,
+            shutdown_rx: None,
             reload_task: None,
             on_change: options.on_change,
         }
@@ -65,10 +64,14 @@ impl SettingsManager {
     }
 
     pub async fn dispose(&mut self) {
-        self.shutdown.notify_waiters();
-        self.reload_signal.notify_waiters();
-        if let Some(task) = self.reload_task.take() { let _ = task.await; }
+        // Drop watcher first to stop generating new file events.
         self.watcher = None;
+        // Signal shutdown via watch channel (remembers state, no lost notifications).
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(true);
+        }
+        if let Some(task) = self.reload_task.take() { let _ = task.await; }
+        let _ = self.shutdown_rx.take();
     }
 
     fn watched_files(&self) -> Vec<PathBuf> {
@@ -120,16 +123,20 @@ impl SettingsManager {
 
     fn start_reload_loop(&mut self) {
         let signal = Arc::clone(&self.reload_signal);
-        let shutdown = Arc::clone(&self.shutdown);
         let effective = Arc::clone(&self.effective);
         let watched = self.watched_files();
         let callback = self.on_change.clone();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_rx = Some(shutdown_rx.clone());
         self.reload_task = Some(tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = shutdown.notified() => break,
+                    _ = shutdown_rx.changed() => break,
                     _ = signal.notified() => {
                         tokio::time::sleep(DEBOUNCE).await;
+                        // Re-check shutdown after debounce sleep (avoids race with dispose).
+                        if *shutdown_rx.borrow() { break; }
                         match load_settings(&watched).await {
                             Ok(next) => {
                                 let mut current = effective.lock().expect("settings mutex poisoned");

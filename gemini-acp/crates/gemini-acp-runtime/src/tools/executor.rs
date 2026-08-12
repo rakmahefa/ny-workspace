@@ -275,7 +275,7 @@ impl<'a> ToolExecutor<'a> {
 
         let output = output_response.output;
         let exit_code = wait_response.exit_status.exit_code;
-        let signal = wait_response.exit_status.signal;
+        let _signal = wait_response.exit_status.signal;
 
         let is_ok = exit_code.unwrap_or(0) == 0;
 

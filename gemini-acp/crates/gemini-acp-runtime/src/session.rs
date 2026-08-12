@@ -58,8 +58,7 @@ impl SessionManager {
 
     pub fn sanitize_title(text: &str) -> Option<String> {
         let title = text
-            .replace('\r', " ")
-            .replace('\n', " ")
+            .replace(['\r', '\n'], " ")
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");

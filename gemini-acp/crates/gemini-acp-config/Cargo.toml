@@ -30,7 +30,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 axum = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
-agent-client-protocol = { workspace = true }
+agent-client-protocol = { workspace = true, features = ["unstable_session_fork"] }
 notify = { workspace = true }
 
 [dev-dependencies]

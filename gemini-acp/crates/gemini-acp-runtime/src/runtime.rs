@@ -142,7 +142,7 @@ mod tests {
         assert!(runtime.settings().await.is_object());
         let names = runtime.state().tools.definitions();
         assert!(names.iter().any(|tool| tool["name"] == "AskUserQuestion"));
-        runtime.state().sessions.store().clone();
+        let _ = runtime.state().sessions.store().clone();
         runtime.shutdown().await;
     }
 

@@ -135,7 +135,8 @@ mod tests {
     #[test]
     fn registry_builtin_has_all_phases() {
         let reg = ToolRegistry::builtin();
-        let names: Vec<&str> = reg.definitions().iter().filter_map(|d| d.get("name").and_then(Value::as_str)).collect();
+        let defs = reg.definitions();
+        let names: Vec<&str> = defs.iter().filter_map(|d| d.get("name").and_then(Value::as_str)).collect();
         for expected in ["file_read", "file_write", "file_edit", "shell_exec", "search", "search_and_read", "replace_in_file"] { assert!(names.contains(&expected), "missing {expected}"); }
     }
 
