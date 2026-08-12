@@ -1,21 +1,20 @@
-//! Outil shell : `shell_exec`.
+//! Builtin terminal tool.
 //!
-//! Exécute une commande shell dans le CWD de la session.
-//! Timeout dur de 30s pour éviter les processus zombies.
-//! Capture stdout + stderr (tronqué à 32 KiB).
-//!
-//! Sécurité : utilise `sandbox::ShellSandbox` pour bloquer les commandes dangereuses.
+//! The shell implementation remains on the existing `Tool` / `ToolRegistry`
+//! architecture. It adds bounded execution, explicit security analysis,
+//! deterministic output formatting, and process cleanup on timeout.
 
 use std::path::{Path, PathBuf};
-
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::tools::registry::{Tool, ToolDef, ToolResult};
 use crate::tools::sandbox;
 
-const TIMEOUT_SECS: u64 = 30;
-const MAX_OUTPUT: usize = 32 * 1024;
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+const MAX_TIMEOUT_SECS: u64 = 120;
+const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 fn shell_params() -> Value {
     json!({
@@ -23,11 +22,13 @@ fn shell_params() -> Value {
         "properties": {
             "command": {
                 "type": "string",
-                "description": "Commande shell à exécuter"
+                "description": "Commande shell à exécuter dans le répertoire de travail"
             },
             "timeout": {
                 "type": "integer",
-                "description": "Timeout en secondes (défaut 30, max 120)"
+                "minimum": 1,
+                "maximum": 120,
+                "description": "Timeout en secondes. Défaut: 30, maximum: 120."
             }
         },
         "required": ["command"]
@@ -37,8 +38,7 @@ fn shell_params() -> Value {
 fn shell_def() -> ToolDef {
     ToolDef {
         name: "shell_exec",
-        description: "Exécute une commande shell dans le répertoire de travail. \
-Retourne le stdout et stderr combinés.",
+        description: "Exécute une commande shell dans le répertoire de travail avec sandbox, timeout et sortie bornée.",
         parameters_fn: shell_params,
     }
 }
@@ -59,65 +59,114 @@ impl Tool for ShellExecTool {
         _allowed_dirs: &[PathBuf],
     ) -> ToolResult {
         let command = match args.get("command").and_then(Value::as_str) {
-            Some(c) => c,
-            None => return ToolResult::Err("paramètre 'command' manquant".into()),
+            Some(value) if !value.trim().is_empty() => value,
+            _ => return ToolResult::Err("paramètre 'command' manquant ou vide".into()),
         };
-        let timeout = args
+
+        let timeout_secs = args
             .get("timeout")
             .and_then(Value::as_u64)
-            .unwrap_or(TIMEOUT_SECS)
-            .min(120);
+            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .clamp(1, MAX_TIMEOUT_SECS);
 
-        // Validation sandbox : bloque les commandes dangereuses.
-        // La sandbox est toujours active pour shell (pas de flag pour désactiver
-        // depuis le Tool trait — la config est dans ToolRegistry.sandbox).
-        let sb = sandbox::ShellSandbox::new();
-        if let Err(e) = sb.validate(command) {
-            tracing::warn!(command = %command, "commande bloquée par la sandbox");
-            return ToolResult::Err(e.to_string());
-        }
-
-        tracing::info!(command = %command, cwd = %cwd.display(), timeout = timeout, "shell_exec");
-
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(timeout),
-            tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .current_dir(cwd)
-                .output(),
-        )
-        .await
-        {
-            Ok(Ok(output)) => {
-                let mut result = String::new();
-                if !output.stdout.is_empty() {
-                    result.push_str(&String::from_utf8_lossy(&output.stdout));
-                }
-                if !output.stderr.is_empty() {
-                    if !result.is_empty() {
-                        result.push_str("\n[stderr]\n");
-                    }
-                    result.push_str(&String::from_utf8_lossy(&output.stderr));
-                }
-                if result.is_empty() {
-                    result = "(sortie vide)".into();
-                }
-                if result.len() > MAX_OUTPUT {
-                    result.truncate(MAX_OUTPUT);
-                    result.push_str("\n… (tronqué)");
-                }
-                let status = if output.status.success() {
-                    "exit code 0"
-                } else {
-                    &format!("exit code {}", output.status.code().unwrap_or(-1))
-                };
-                ToolResult::Ok(format!("[{status}]\n{result}"))
+        let analysis = match sandbox::ShellSandbox::new().analyze_command(command) {
+            Ok(analysis) => analysis,
+            Err(error) => {
+                tracing::warn!(command = %command, error = %error, "commande shell bloquée");
+                return ToolResult::Err(error.to_string());
             }
-            Ok(Err(e)) => ToolResult::Err(format!("échec de l'exécution : {e}")),
-            Err(_) => ToolResult::Err(format!("timeout après {timeout}s")),
+        };
+
+        tracing::info!(
+            command = %command,
+            cwd = %cwd.display(),
+            timeout_secs,
+            risk = %analysis.risk,
+            "shell_exec"
+        );
+
+        let child = match tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(cwd)
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => return ToolResult::Err(format!("échec du démarrage du shell: {error}")),
+        };
+
+        let execution = tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            child.wait_with_output(),
+        );
+
+        match execution.await {
+            Ok(Ok(output)) => format_shell_output(&output, &analysis),
+            Ok(Err(error)) => ToolResult::Err(format!("échec de l'exécution: {error}")),
+            Err(_) => ToolResult::Err(format!(
+                "timeout après {timeout_secs}s; processus interrompu"
+            )),
         }
     }
+}
+
+fn format_shell_output(
+    output: &std::process::Output,
+    analysis: &sandbox::ShellAnalysis,
+) -> ToolResult {
+    let mut body = String::new();
+
+    if !output.stdout.is_empty() {
+        body.push_str(&String::from_utf8_lossy(&output.stdout));
+    }
+
+    if !output.stderr.is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str("[stderr]\n");
+        body.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+
+    if body.is_empty() {
+        body.push_str("(sortie vide)");
+    }
+
+    let truncated = truncate_utf8(&mut body, MAX_OUTPUT_BYTES);
+    if truncated {
+        body.push_str("\n… (sortie tronquée)");
+    }
+
+    let status = match output.status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => "processus terminé par signal".to_string(),
+    };
+
+    let mut result = format!("[{status}]\n{body}");
+    if truncated {
+        result.push_str(&format!("\n[output_limit={} bytes]", MAX_OUTPUT_BYTES));
+    }
+    result.push_str(&format!("\n[risk={}]", analysis.risk.label()));
+
+    ToolResult::Ok(result)
+}
+
+fn truncate_utf8(value: &mut String, max_bytes: usize) -> bool {
+    if value.len() <= max_bytes {
+        return false;
+    }
+
+    let cut = value
+        .char_indices()
+        .take_while(|(index, _)| *index < max_bytes)
+        .map(|(index, _)| index)
+        .last()
+        .unwrap_or(0);
+    value.truncate(cut);
+    true
 }
 
 #[cfg(test)]
@@ -126,48 +175,75 @@ mod tests {
 
     #[tokio::test]
     async fn shell_echo() {
-        let tool = ShellExecTool;
-        let args = json!({"command": "echo hello"});
-        let result = tool.execute(&args, Path::new("/tmp"), &[]).await;
-        match result {
-            ToolResult::Ok(s) => {
-                assert!(s.contains("hello"));
-                assert!(s.contains("exit code 0"));
-            }
-            ToolResult::Err(e) => panic!("erreur inattendue : {e}"),
-        }
+        let result = ShellExecTool
+            .execute(&json!({"command": "echo hello"}), Path::new("/tmp"), &[])
+            .await;
+
+        assert!(matches!(result, ToolResult::Ok(output) if output.contains("hello") && output.contains("exit code 0")));
     }
 
     #[tokio::test]
-    async fn shell_timeout() {
-        let tool = ShellExecTool;
-        let args = json!({"command": "sleep 60", "timeout": 1});
-        let result = tool.execute(&args, Path::new("/tmp"), &[]).await;
-        assert!(matches!(result, ToolResult::Err(e) if e.contains("timeout")));
+    async fn shell_non_zero_exit_is_reported() {
+        let result = ShellExecTool
+            .execute(&json!({"command": "false"}), Path::new("/tmp"), &[])
+            .await;
+
+        assert!(matches!(result, ToolResult::Ok(output) if output.contains("exit code 1")));
     }
 
     #[tokio::test]
-    async fn shell_sudo_bloque() {
-        let tool = ShellExecTool;
-        let args = json!({"command": "sudo rm -rf /"});
-        let result = tool.execute(&args, Path::new("/tmp"), &[]).await;
-        assert!(matches!(result, ToolResult::Err(e) if e.contains("Sécurité")));
+    async fn shell_timeout_interrupts_process() {
+        let result = ShellExecTool
+            .execute(
+                &json!({"command": "sleep 60", "timeout": 1}),
+                Path::new("/tmp"),
+                &[],
+            )
+            .await;
+
+        assert!(matches!(result, ToolResult::Err(error) if error.contains("timeout")));
     }
 
     #[tokio::test]
-    async fn shell_shutdown_bloque() {
-        let tool = ShellExecTool;
-        let args = json!({"command": "shutdown now"});
-        let result = tool.execute(&args, Path::new("/tmp"), &[]).await;
-        assert!(matches!(result, ToolResult::Err(e) if e.contains("Sécurité")));
+    async fn shell_blocks_dangerous_command() {
+        let result = ShellExecTool
+            .execute(&json!({"command": "sudo rm -rf /"}), Path::new("/tmp"), &[])
+            .await;
+
+        assert!(matches!(result, ToolResult::Err(error) if error.contains("Sécurité")));
     }
 
     #[tokio::test]
-    async fn shell_git_autorise() {
-        let tool = ShellExecTool;
-        let args = json!({"command": "git status"});
-        let result = tool.execute(&args, Path::new("/tmp"), &[]).await;
-        // git status peut échouer si pas un repo, mais pas bloqué par sandbox
-        assert!(!matches!(result, ToolResult::Err(e) if e.contains("Sécurité")));
+    async fn shell_blocks_system_shutdown() {
+        let result = ShellExecTool
+            .execute(&json!({"command": "shutdown now"}), Path::new("/tmp"), &[])
+            .await;
+
+        assert!(matches!(result, ToolResult::Err(error) if error.contains("Sécurité")));
+    }
+
+    #[tokio::test]
+    async fn shell_allows_git() {
+        let result = ShellExecTool
+            .execute(&json!({"command": "git status"}), Path::new("/tmp"), &[])
+            .await;
+
+        assert!(!matches!(result, ToolResult::Err(error) if error.contains("Sécurité")));
+    }
+
+    #[test]
+    fn truncate_preserves_utf8() {
+        let mut value = "é".repeat(8);
+        assert!(truncate_utf8(&mut value, 9));
+        assert_eq!(value, "é".repeat(4));
+    }
+
+    #[tokio::test]
+    async fn shell_reports_risk_metadata() {
+        let result = ShellExecTool
+            .execute(&json!({"command": "ls"}), Path::new("/tmp"), &[])
+            .await;
+
+        assert!(matches!(result, ToolResult::Ok(output) if output.contains("[risk=low]")));
     }
 }
