@@ -26,10 +26,7 @@ pub struct SandboxConfig {
 
 impl Default for SandboxConfig {
     fn default() -> Self {
-        Self {
-            allowed_dirs: Vec::new(),
-            shell_sandbox_enabled: true,
-        }
+        Self { allowed_dirs: Vec::new(), shell_sandbox_enabled: true }
     }
 }
 
@@ -46,101 +43,61 @@ pub struct ToolDef {
 
 impl std::fmt::Debug for ToolDef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ToolDef")
-            .field("name", &self.name)
-            .field("description", &self.description)
-            .finish()
+        f.debug_struct("ToolDef").field("name", &self.name).field("description", &self.description).finish()
     }
 }
 
 impl ToolDef {
     /// Sérialise en objet JSON `{name, description, parameters}`.
     pub fn to_json(&self) -> Value {
-        serde_json::json!({
-            "name": self.name,
-            "description": self.description,
-            "parameters": (self.parameters_fn)(),
-        })
+        serde_json::json!({ "name": self.name, "description": self.description, "parameters": (self.parameters_fn)() })
     }
 }
 
 /// Résultat d'exécution d'un outil.
 #[derive(Debug, Clone)]
 pub enum ToolResult {
-    /// Exécution réussie, contenu texte.
     Ok(String),
-    /// Erreur lors de l'exécution.
     Err(String),
 }
 
 impl ToolResult {
-    pub fn is_ok(&self) -> bool {
-        matches!(self, ToolResult::Ok(_))
-    }
+    pub fn is_ok(&self) -> bool { matches!(self, ToolResult::Ok(_)) }
 
     /// Formate pour injection dans l'historique `[Tool result for <name>]: …`.
     pub fn to_history_text(&self) -> String {
-        match self {
-            ToolResult::Ok(s) => s.clone(),
-            ToolResult::Err(e) => format!("[Erreur] {e}"),
-        }
+        match self { ToolResult::Ok(s) => s.clone(), ToolResult::Err(e) => format!("[Erreur] {e}") }
     }
 }
 
 /// Interface que chaque outil builtin doit implémenter.
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
-    /// Descripteur de l'outil (injected dans le prompt).
     fn definition(&self) -> &ToolDef;
-
-    /// Exécute l'outil avec les arguments JSON fournis par le modèle.
-    /// Le `cwd` est le répertoire de travail de la session.
-    /// `allowed_dirs` contient les répertoires additionnels autorisés.
     async fn execute(&self, args: &Value, cwd: &Path, allowed_dirs: &[PathBuf]) -> ToolResult;
 }
 
 /// Registre : collection nommée d'outils.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
-    /// Configuration de sandbox pour cette session.
     sandbox: SandboxConfig,
 }
 
 impl std::fmt::Debug for ToolRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let names: Vec<&str> = self.tools.iter().map(|t| t.definition().name).collect();
-        f.debug_struct("ToolRegistry")
-            .field("tools", &names)
-            .field("sandbox", &self.sandbox)
-            .finish()
+        f.debug_struct("ToolRegistry").field("tools", &names).field("sandbox", &self.sandbox).finish()
     }
 }
 
-impl Default for ToolRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+impl Default for ToolRegistry { fn default() -> Self { Self::new() } }
 
 impl ToolRegistry {
-    /// Crée un registre vide avec la sandbox par défaut.
-    pub fn new() -> Self {
-        Self {
-            tools: Vec::new(),
-            sandbox: SandboxConfig::default(),
-        }
-    }
+    pub fn new() -> Self { Self { tools: Vec::new(), sandbox: SandboxConfig::default() } }
 
-    /// Crée un registre vide avec une configuration de sandbox personnalisée.
     #[allow(dead_code)]
-    pub fn with_sandbox(sandbox: SandboxConfig) -> Self {
-        Self {
-            tools: Vec::new(),
-            sandbox,
-        }
-    }
+    pub fn with_sandbox(sandbox: SandboxConfig) -> Self { Self { tools: Vec::new(), sandbox } }
 
-    /// Ajoute un outil au registre.
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         tracing::debug!(name = tool.definition().name, "outil enregistré");
         self.tools.push(tool);
@@ -151,6 +108,7 @@ impl ToolRegistry {
         let mut reg = Self::new();
         reg.register(Box::new(crate::tools::builtin::file::FileReadTool));
         reg.register(Box::new(crate::tools::builtin::file::FileWriteTool));
+        reg.register(Box::new(crate::tools::builtin::file::FileEditTool));
         reg.register(Box::new(crate::tools::builtin::shell::ShellExecTool));
         reg.register(Box::new(crate::tools::builtin::search::SearchTool));
         reg
@@ -162,53 +120,28 @@ impl ToolRegistry {
         let mut reg = Self::with_sandbox(sandbox);
         reg.register(Box::new(crate::tools::builtin::file::FileReadTool));
         reg.register(Box::new(crate::tools::builtin::file::FileWriteTool));
+        reg.register(Box::new(crate::tools::builtin::file::FileEditTool));
         reg.register(Box::new(crate::tools::builtin::shell::ShellExecTool));
         reg.register(Box::new(crate::tools::builtin::search::SearchTool));
         reg
     }
 
-    /// Liste les descripteurs JSON de tous les outils.
-    pub fn definitions(&self) -> Vec<Value> {
-        self.tools
-            .iter()
-            .map(|t| t.definition().to_json())
-            .collect()
-    }
+    pub fn definitions(&self) -> Vec<Value> { self.tools.iter().map(|t| t.definition().to_json()).collect() }
 
-    /// Retourne la configuration de sandbox.
     #[allow(dead_code)]
-    pub fn sandbox(&self) -> &SandboxConfig {
-        &self.sandbox
-    }
+    pub fn sandbox(&self) -> &SandboxConfig { &self.sandbox }
 
-    /// Cherche un outil par nom et l'exécute de façon **async native**.
-    /// C'est la méthode préférée — pas de `block_on`.
-    ///
-    /// **BUG-05** : `extra_dirs` fusionnés avec `sandbox.allowed_dirs` pour
-    /// propager les `additional_directories` de la session aux outils.
-    pub async fn call_async(
-        &self,
-        name: &str,
-        args: &Value,
-        cwd: &Path,
-        extra_dirs: &[PathBuf],
-    ) -> Option<ToolResult> {
+    /// Cherche un outil par nom et l'exécute de façon async native.
+    pub async fn call_async(&self, name: &str, args: &Value, cwd: &Path, extra_dirs: &[PathBuf]) -> Option<ToolResult> {
         let tool = self.tools.iter().find(|t| t.definition().name == name)?;
-        // Fusionner allowed_dirs de la sandbox + dirs additionnels de la session.
         let mut allowed = self.sandbox.allowed_dirs.clone();
-        for d in extra_dirs {
-            if !allowed.contains(d) {
-                allowed.push(d.clone());
-            }
+        for dir in extra_dirs {
+            if !allowed.contains(dir) { allowed.push(dir.clone()); }
         }
-        let result = tool.execute(args, cwd, &allowed).await;
-        Some(result)
+        Some(tool.execute(args, cwd, &allowed).await)
     }
 
-    /// Retourne `true` si au moins un outil est enregistré.
-    pub fn has_tools(&self) -> bool {
-        !self.tools.is_empty()
-    }
+    pub fn has_tools(&self) -> bool { !self.tools.is_empty() }
 }
 
 #[cfg(test)]
@@ -217,37 +150,17 @@ mod tests {
     use serde_json::json;
 
     struct EchoTool;
-
     fn echo_def() -> ToolDef {
-        ToolDef {
-            name: "echo",
-            description: "Répète le message.",
-            parameters_fn: || {
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "message": { "type": "string", "description": "Message à répéter" }
-                    },
-                    "required": ["message"]
-                })
-            },
-        }
+        ToolDef { name: "echo", description: "Répète le message.", parameters_fn: || json!({
+            "type": "object", "properties": { "message": { "type": "string", "description": "Message à répéter" } }, "required": ["message"]
+        }) }
     }
 
     #[async_trait::async_trait]
     impl Tool for EchoTool {
-        fn definition(&self) -> &ToolDef {
-            static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
-            DEF.get_or_init(echo_def)
-        }
-        async fn execute(
-            &self,
-            args: &Value,
-            _cwd: &Path,
-            _allowed_dirs: &[PathBuf],
-        ) -> ToolResult {
-            let msg = args.get("message").and_then(Value::as_str).unwrap_or("");
-            ToolResult::Ok(msg.to_string())
+        fn definition(&self) -> &ToolDef { static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new(); DEF.get_or_init(echo_def) }
+        async fn execute(&self, args: &Value, _cwd: &Path, _allowed_dirs: &[PathBuf]) -> ToolResult {
+            ToolResult::Ok(args.get("message").and_then(Value::as_str).unwrap_or("").to_string())
         }
     }
 
@@ -256,13 +169,11 @@ mod tests {
         let reg = ToolRegistry::builtin();
         assert!(reg.has_tools());
         let defs = reg.definitions();
-        assert!(defs.len() >= 4);
-        let names: Vec<&str> = defs
-            .iter()
-            .filter_map(|d| d.get("name").and_then(Value::as_str))
-            .collect();
+        assert!(defs.len() >= 5);
+        let names: Vec<&str> = defs.iter().filter_map(|d| d.get("name").and_then(Value::as_str)).collect();
         assert!(names.contains(&"file_read"));
         assert!(names.contains(&"file_write"));
+        assert!(names.contains(&"file_edit"));
         assert!(names.contains(&"shell_exec"));
         assert!(names.contains(&"search"));
     }
@@ -271,15 +182,7 @@ mod tests {
     async fn call_async_basic() {
         let mut reg = ToolRegistry::new();
         reg.register(Box::new(EchoTool));
-        let result = reg
-            .call_async(
-                "echo",
-                &json!({"message": "bonjour"}),
-                Path::new("/tmp"),
-                &[],
-            )
-            .await
-            .unwrap();
+        let result = reg.call_async("echo", &json!({"message": "bonjour"}), Path::new("/tmp"), &[]).await.unwrap();
         assert!(result.is_ok());
         assert_eq!(result.to_history_text(), "bonjour");
     }
@@ -287,27 +190,19 @@ mod tests {
     #[tokio::test]
     async fn call_async_unknown_tool() {
         let reg = ToolRegistry::new();
-        let result = reg
-            .call_async("nonexistent", &json!({}), Path::new("/tmp"), &[])
-            .await;
+        let result = reg.call_async("nonexistent", &json!({}), Path::new("/tmp"), &[]).await;
         assert!(result.is_none());
     }
 
     #[test]
     fn tool_result_to_history() {
-        let ok = ToolResult::Ok("contenu du fichier".into());
-        assert_eq!(ok.to_history_text(), "contenu du fichier");
-        let err = ToolResult::Err("fichier introuvable".into());
-        assert!(err.to_history_text().contains("[Erreur]"));
+        assert_eq!(ToolResult::Ok("contenu du fichier".into()).to_history_text(), "contenu du fichier");
+        assert!(ToolResult::Err("fichier introuvable".into()).to_history_text().contains("[Erreur]"));
     }
 
     #[test]
     fn tool_def_to_json() {
-        let def = ToolDef {
-            name: "test",
-            description: "un test",
-            parameters_fn: || json!({"type": "object"}),
-        };
+        let def = ToolDef { name: "test", description: "un test", parameters_fn: || json!({"type": "object"}) };
         let j = def.to_json();
         assert_eq!(j["name"], "test");
         assert_eq!(j["description"], "un test");
@@ -322,10 +217,7 @@ mod tests {
 
     #[test]
     fn registry_with_custom_sandbox() {
-        let cfg = SandboxConfig {
-            allowed_dirs: vec![PathBuf::from("/opt/project")],
-            shell_sandbox_enabled: false,
-        };
+        let cfg = SandboxConfig { allowed_dirs: vec![PathBuf::from("/opt/project")], shell_sandbox_enabled: false };
         let reg = ToolRegistry::builtin_with_sandbox(cfg);
         assert!(!reg.sandbox().shell_sandbox_enabled);
         assert_eq!(reg.sandbox().allowed_dirs.len(), 1);
