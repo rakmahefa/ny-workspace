@@ -230,6 +230,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn golden_titles_match_markdown_ux() {
+        let cwd = Path::new("/tmp/test-workspace");
+
+        let read = ToolInfo::build(
+            "file_read",
+            &serde_json::json!({"path":"test_tool_demo.txt","offset":1,"limit":10}),
+            cwd,
+            None,
+        );
+        assert_eq!(read.title, "Read test_tool_demo.txt (1-10)");
+
+        let write = ToolInfo::build(
+            "file_write",
+            &serde_json::json!({"path":"test_tool_demo.txt","content":"hello"}),
+            cwd,
+            None,
+        );
+        assert_eq!(write.title, "Write test_tool_demo.txt");
+
+        let edit = ToolInfo::build(
+            "file_edit",
+            &serde_json::json!({"path":"test_tool_demo.txt","old_string":"a","new_string":"b"}),
+            cwd,
+            None,
+        );
+        assert_eq!(edit.title, "Edit test_tool_demo.txt");
+
+        let search = ToolInfo::build(
+            "search",
+            &serde_json::json!({"path":"test_tool_demo.txt","pattern":"réussi"}),
+            cwd,
+            None,
+        );
+        assert_eq!(search.title, "Find `réussi` in test_tool_demo.txt");
+
+        let excerpts = ToolInfo::build(
+            "search_and_read",
+            &serde_json::json!({"path":"test_tool_demo.txt","pattern":"Bonjour","context":1}),
+            cwd,
+            None,
+        );
+        assert_eq!(excerpts.title, "Find excerpts for `Bonjour` in test_tool_demo.txt");
+
+        let shell = ToolInfo::build(
+            "shell_exec",
+            &serde_json::json!({"command":"echo 'Liste des outils demandée'"}),
+            cwd,
+            None,
+        );
+        assert_eq!(shell.title, "echo 'Liste des outils demandée'");
+    }
+
+    #[test]
     fn write_is_rendered_as_diff() {
         let cwd = Path::new("/tmp/project");
         let info = ToolInfo::build("file_write", &serde_json::json!({"path":"src/lib.rs","content":"fn main() {}"}), cwd, None);
