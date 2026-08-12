@@ -1,8 +1,8 @@
 //! Runtime de l'agent : construction et cycle de vie de l'état applicatif.
 //!
 //! Inspiré du rôle de `ClaudeAcpAgent` dans `vendor/claude-agent-acp` : ce
-//! module possède le `state::Store`, le `client::Client` Gemini, le registre
-//! d'outils et maintenant le `SettingsManager` dynamique.
+//! module possède le `state::Store`, le `SessionManager`, le client Gemini,
+//! le registre d'outils et le `SettingsManager` dynamique.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 
 use gemini_acp_config::{AgentConfig, SettingsManager, SettingsManagerOptions};
 
+use crate::session::SessionManager;
 use crate::tools::ToolRegistry;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -19,6 +20,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<crate::state::Store>,
+    pub sessions: SessionManager,
     pub client: gemini_acp_config::client::Client,
     pub config: Arc<AgentConfig>,
     pub settings: Arc<tokio::sync::Mutex<SettingsManager>>,
@@ -47,6 +49,7 @@ impl AgentRuntime {
                 .await
                 .with_context(|| format!("ouverture du store {}", config.data_dir.display()))?,
         );
+        let sessions = SessionManager::new(Arc::clone(&store));
 
         let client = gemini_acp_config::client::Client::new(gemini_acp_config::client::Config {
             cookie_file: config.cookie_file.clone(),
@@ -78,6 +81,7 @@ impl AgentRuntime {
         Ok(Self {
             state: AppState {
                 store,
+                sessions,
                 client,
                 config: Arc::new(config),
                 settings: Arc::new(tokio::sync::Mutex::new(settings)),
@@ -131,13 +135,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_from_config_creates_state_and_settings_manager() {
+    async fn runtime_from_config_creates_state_and_session_manager() {
         let config = test_config();
         let runtime = AgentRuntime::from_config(config).await.expect("runtime");
         assert!(runtime.state().store.list(None).await.is_empty());
         assert!(runtime.settings().await.is_object());
         let names = runtime.state().tools.definitions();
         assert!(names.iter().any(|tool| tool["name"] == "AskUserQuestion"));
+        runtime.state().sessions.store().clone();
         runtime.shutdown().await;
     }
 
