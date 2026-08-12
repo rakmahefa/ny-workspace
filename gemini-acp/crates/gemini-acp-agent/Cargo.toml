@@ -31,8 +31,6 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 regex = { workspace = true }
 async-trait = { workspace = true }
-futures-core = { workspace = true }
-futures-util = { workspace = true }
 
 [features]
 default = ["unstable_session_fork"]
