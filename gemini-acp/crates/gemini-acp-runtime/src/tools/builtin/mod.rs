@@ -1,7 +1,8 @@
-//! Outils builtin : file_read, file_write, shell_exec, search.
+//! Builtin tools.
 //!
-//! Chaque outil est une struct unitaire implémentant `tools::registry::Tool`.
-//! Les paramètres sont limités pour rester cohérent avec un agent de codage.
+//! Filesystem tools are implemented first and remain on the existing `Tool`
+//! trait/registry path. Shell and search stay unchanged until their dedicated
+//! migration phases.
 
 pub mod file;
 pub mod search;
