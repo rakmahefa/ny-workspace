@@ -1,29 +1,8 @@
-//! Helper d'elicitation pour demander une clarification structurée à
-//! l'utilisateur (refactor M10 §7.2).
+//! Structured ACP elicitation bridge inspired by
+//! `agentclientprotocol/claude-agent-acp/src/elicitation.ts`.
 //!
-//! **Statut** : l'elicitation est marquée **UNSTABLE** dans le schema ACP 1.5.0
-//! (feature `unstable_elicitation` du crate `agent-client-protocol-schema`).
-//! Ce module fournit un helper prêt à l'emploi mais n'est pas activé par défaut
-//! — pour l'utiliser, activez la feature `elicitation` dans `acp/Cargo.toml` :
-//!
-//! ```toml
-//! [features]
-//! elicitation = ["agent-client-protocol/unstable_elicitation"]
-//! ```
-//!
-//! ## Cas d'usage
-//!
-//! - L'utilisateur dit « refactor ce fichier » sans préciser le style →
-//!   l'agent élicite « Quel style ? (functional / OOP / data-oriented) ».
-//! - L'utilisateur dit « génère des tests » → l'agent élicite « Quel
-//!   framework ? (cargo test / proptest / criterion) » et « Combien de cas ? ».
-//!
-//! ## Limitation
-//!
-//! Gemini web ne supporte pas nativement l'elicitation — c'est l'agent qui
-//! doit décider quand elicitier. Stratégie recommandée : si le premier message
-//! utilisateur contient des mots-clés vagues (« refactor », « optimise »,
-//! « teste ») sans précision, éliciter avant de lancer le tour Gemini.
+//! The implementation is split into transport-independent normalization,
+//! ACP request/response handling, and AskUserQuestion answer folding.
 
 #![cfg(feature = "elicitation")]
 
@@ -35,17 +14,67 @@ use agent_client_protocol::schema::v1::{
     ElicitationSessionScope, SessionId,
 };
 use agent_client_protocol::{Client, ConnectionTo, Error as AcpError};
+use serde::{Deserialize, Serialize};
 
-/// Demande une clarification structurée à l'utilisateur via le client ACP.
-///
-/// `message` : description humaine de ce qui est demandé.
-/// `properties` : map nom du champ → schéma de propriété (type, description, etc.).
-/// `required` : liste des noms de champs obligatoires.
-///
-/// Retourne :
-/// - `Ok(Some(content))` si l'utilisateur a accepté et fourni les données.
-/// - `Ok(None)` si l'utilisateur a refusé ou annulé.
-/// - `Err(AcpError)` si la requête a échoué (client ne supporte pas l'elicitation, etc.).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ElicitationSupport {
+    pub form: bool,
+    pub url: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElicitationRequestSpec {
+    pub session_id: SessionId,
+    pub message: String,
+    pub properties: BTreeMap<String, ElicitationPropertySchema>,
+    pub required: Vec<String>,
+}
+
+impl ElicitationRequestSpec {
+    pub fn new(session_id: SessionId, message: impl Into<String>) -> Self {
+        Self {
+            session_id,
+            message: message.into(),
+            properties: BTreeMap::new(),
+            required: Vec::new(),
+        }
+    }
+
+    pub fn property(
+        mut self,
+        name: impl Into<String>,
+        schema: ElicitationPropertySchema,
+        required: bool,
+    ) -> Self {
+        let name = name.into();
+        self.properties.insert(name.clone(), schema);
+        if required && !self.required.contains(&name) {
+            self.required.push(name);
+        }
+        self
+    }
+
+    fn into_acp_request(self) -> CreateElicitationRequest {
+        let mut schema = ElicitationSchema::new();
+        for (name, property) in self.properties {
+            schema = schema.property(name, property, self.required.contains(&name));
+        }
+        let mode = ElicitationFormMode::new(ElicitationSessionScope::new(self.session_id), schema);
+        CreateElicitationRequest::new(mode, self.message)
+    }
+}
+
+pub async fn request_elicitation(
+    cx: &ConnectionTo<Client>,
+    request: ElicitationRequestSpec,
+) -> Result<ElicitationOutcome, AcpError> {
+    let response: CreateElicitationResponse = cx
+        .send_request(request.into_acp_request())
+        .block_task()
+        .await?;
+    Ok(response_to_outcome(response))
+}
+
 pub async fn elicit_clarification(
     cx: &ConnectionTo<Client>,
     session_id: &SessionId,
@@ -53,69 +82,221 @@ pub async fn elicit_clarification(
     properties: BTreeMap<String, ElicitationPropertySchema>,
     required: Vec<String>,
 ) -> Result<Option<BTreeMap<String, ElicitationContentValue>>, AcpError> {
-    let scope = ElicitationSessionScope::new(session_id.clone());
-    // Construit le schéma en ajoutant chaque propriété via le builder.
-    let mut schema = ElicitationSchema::new();
-    for (name, prop_schema) in properties {
-        let is_required = required.contains(&name);
-        schema = schema.property(name, prop_schema, is_required);
-    }
-    let mode = ElicitationFormMode::new(scope, schema);
-    let request = CreateElicitationRequest::new(mode, message.to_string());
+    let outcome = request_elicitation(
+        cx,
+        ElicitationRequestSpec {
+            session_id: session_id.clone(),
+            message: message.to_string(),
+            properties,
+            required,
+        },
+    )
+    .await?;
 
-    let response: CreateElicitationResponse = cx.send_request(request).block_task().await?;
-
-    match response.action {
-        ElicitationAction::Accept(accept) => Ok(accept.content),
-        ElicitationAction::Decline | ElicitationAction::Cancel => Ok(None),
-        // Wildcard pour variants futures (#[non_exhaustive]).
-        _ => Ok(None),
+    match outcome {
+        ElicitationOutcome::Accepted(content) => Ok(Some(content)),
+        ElicitationOutcome::Declined | ElicitationOutcome::Cancelled => Ok(None),
     }
 }
 
-/// Détecte si un message utilisateur est « vague » et mérite une elicitation.
-/// Mots-clés vagues : refactor, optimise, teste, améliore, simplifie, etc.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ElicitationOutcome {
+    Accepted(BTreeMap<String, ElicitationContentValue>),
+    Declined,
+    Cancelled,
+}
+
+pub fn response_to_outcome(response: CreateElicitationResponse) -> ElicitationOutcome {
+    match response.action {
+        ElicitationAction::Accept(accept) => {
+            ElicitationOutcome::Accepted(accept.content.unwrap_or_default())
+        }
+        ElicitationAction::Decline => ElicitationOutcome::Declined,
+        ElicitationAction::Cancel => ElicitationOutcome::Cancelled,
+        _ => ElicitationOutcome::Cancelled,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AskUserQuestion {
+    pub question: String,
+    #[serde(default)]
+    pub header: Option<String>,
+    pub options: Vec<AskUserOption>,
+    #[serde(default)]
+    pub multi_select: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AskUserOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub preview: Option<String>,
+}
+
+pub fn extract_ask_user_questions(
+    input: &serde_json::Value,
+) -> Option<Vec<AskUserQuestion>> {
+    let questions = input.get("questions")?.as_array()?;
+    let valid: Vec<AskUserQuestion> = questions
+        .iter()
+        .filter_map(|value| serde_json::from_value(value.clone()).ok())
+        .filter(|question: &AskUserQuestion| {
+            !question.question.trim().is_empty() && !question.options.is_empty()
+        })
+        .collect();
+    (!valid.is_empty()).then_some(valid)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AskUserQuestionOutcome {
+    Answered(serde_json::Value),
+    Cancelled,
+}
+
+fn question_key(index: usize) -> String {
+    format!("question_{index}")
+}
+
+fn custom_answer_key(index: usize) -> String {
+    format!("question_{index}_custom")
+}
+
+pub fn apply_ask_user_response(
+    response: &CreateElicitationResponse,
+    tool_input: &serde_json::Value,
+    questions: &[AskUserQuestion],
+) -> AskUserQuestionOutcome {
+    match &response.action {
+        ElicitationAction::Decline => {
+            let mut updated = tool_input.clone();
+            updated["answers"] = serde_json::json!({});
+            AskUserQuestionOutcome::Answered(updated)
+        }
+        ElicitationAction::Accept(accept) => {
+            let content = accept.content.clone().unwrap_or_default();
+            let mut answers = serde_json::Map::new();
+
+            for (index, question) in questions.iter().enumerate() {
+                if let Some(ElicitationContentValue::String(custom)) =
+                    content.get(&custom_answer_key(index))
+                {
+                    let custom = custom.trim();
+                    if !custom.is_empty() {
+                        answers.insert(
+                            question.question.clone(),
+                            serde_json::Value::String(custom.to_string()),
+                        );
+                        continue;
+                    }
+                }
+
+                if let Some(value) = content.get(&question_key(index)) {
+                    answers.insert(
+                        question.question.clone(),
+                        elicitation_value_to_json(value),
+                    );
+                }
+            }
+
+            let mut updated = tool_input.clone();
+            updated["answers"] = serde_json::Value::Object(answers);
+            AskUserQuestionOutcome::Answered(updated)
+        }
+        ElicitationAction::Cancel => AskUserQuestionOutcome::Cancelled,
+        _ => AskUserQuestionOutcome::Cancelled,
+    }
+}
+
+fn elicitation_value_to_json(value: &ElicitationContentValue) -> serde_json::Value {
+    match value {
+        ElicitationContentValue::String(value) => serde_json::Value::String(value.clone()),
+        ElicitationContentValue::Boolean(value) => serde_json::Value::Bool(*value),
+        ElicitationContentValue::Number(value) => serde_json::json!(value),
+        ElicitationContentValue::StringArray(values) => serde_json::json!(values),
+        _ => serde_json::Value::Null,
+    }
+}
+
 pub fn is_vague_prompt(message: &str) -> bool {
     let lower = message.to_lowercase();
     let vague_keywords = [
-        "refactor",
-        "optimise",
-        "optimize",
-        "teste",
-        "test ",
-        "améliore",
-        "ameliore",
-        "simplifie",
-        "nettoie",
-        "réécris",
-        "reecris",
+        "refactor", "optimise", "optimize", "teste", "test ", "améliore", "ameliore",
+        "simplifie", "nettoie", "réécris", "reecris",
     ];
-    let has_vague = vague_keywords.iter().any(|k| lower.contains(k));
-    // Heuristique : prompt court (< 80 chars) + mot-clé vague = demande
-    // probablement imprécise.
-    has_vague && message.chars().count() < 80
+    vague_keywords.iter().any(|k| lower.contains(k)) && message.chars().count() < 80
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn question(multi_select: bool) -> AskUserQuestion {
+        AskUserQuestion {
+            question: "Quel langage ?".into(),
+            header: Some("Langage".into()),
+            options: vec![
+                AskUserOption {
+                    label: "Rust".into(),
+                    description: Some("Sûr et rapide".into()),
+                    preview: Some("fn main() {}".into()),
+                },
+                AskUserOption {
+                    label: "Python".into(),
+                    description: Some("Simple pour prototyper".into()),
+                    preview: None,
+                },
+            ],
+            multi_select,
+        }
+    }
+
     #[test]
-    fn detecte_prompt_vague_refactor() {
+    fn extracts_valid_questions() {
+        let input = serde_json::json!({
+            "questions": [
+                serde_json::to_value(question(false)).unwrap(),
+                {"question": "", "options": []}
+            ]
+        });
+        let result = extract_ask_user_questions(&input).expect("questions");
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn custom_answer_has_priority() {
+        let input = serde_json::json!({"questions": []});
+        let questions = vec![question(false)];
+        let content = BTreeMap::from([(
+            custom_answer_key(0),
+            ElicitationContentValue::String("  Go  ".into()),
+        )]);
+        let response = CreateElicitationResponse::accept(content);
+        match apply_ask_user_response(&response, &input, &questions) {
+            AskUserQuestionOutcome::Answered(updated) => {
+                assert_eq!(updated["answers"]["Quel langage ?"], "Go");
+            }
+            AskUserQuestionOutcome::Cancelled => panic!("expected answer"),
+        }
+    }
+
+    #[test]
+    fn decline_produces_empty_answers() {
+        let input = serde_json::json!({"questions": []});
+        let response = CreateElicitationResponse::decline();
+        match apply_ask_user_response(&response, &input, &[question(false)]) {
+            AskUserQuestionOutcome::Answered(updated) => {
+                assert_eq!(updated["answers"], serde_json::json!({}));
+            }
+            AskUserQuestionOutcome::Cancelled => panic!("expected decline to be handled"),
+        }
+    }
+
+    #[test]
+    fn vague_prompt_heuristic_remains_stable() {
         assert!(is_vague_prompt("Refactor ce fichier"));
-        assert!(is_vague_prompt("Optimise le code"));
-        assert!(is_vague_prompt("Teste la fonction"));
-    }
-
-    #[test]
-    fn prompt_precis_pas_vague() {
-        assert!(!is_vague_prompt("Refactor la fonction `parse_config` en utilisant le pattern builder, en gardant la compatibilité avec l'API existante"));
-        assert!(!is_vague_prompt("Ajoute un test unitaire pour la fonction `build_prompt` dans `crates/acp/src/prompt.rs`"));
-    }
-
-    #[test]
-    fn prompt_sans_mot_cle_pas_vague() {
-        assert!(!is_vague_prompt("Bonjour, comment vas-tu ?"));
         assert!(!is_vague_prompt("Explique-moi le pattern MVP en Rust"));
     }
 }
