@@ -14,7 +14,6 @@ name = "gemini-web2api"
 path = "src/web2api/main.rs"
 
 [dependencies]
-# Ex-dépendances de gemini-core
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha1 = { workspace = true }
@@ -23,21 +22,16 @@ regex = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-
-# Ex-dépendances de gemini-client (réseau)
 reqwest = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 base64 = { workspace = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-
-# Ex-dépendances de gemini-web2api (serveur HTTP)
 axum = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
-
-# Config ACP
 agent-client-protocol = { workspace = true }
+notify = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }
