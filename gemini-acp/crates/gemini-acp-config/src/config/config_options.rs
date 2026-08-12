@@ -1,7 +1,7 @@
 //! Options de configuration exposées à Zed (spec §3.6).
 //!
 //! Refactor R1 — inspiré de `glm-acp-agent` :
-//! - **SessionCapabilities** : ajout de `fork`.
+//! - **SessionCapabilities** : ajout de `fork` et `resume`.
 //! - **Modes** : les modes sont maintenant gérés par le handler
 //!   `session/set_mode`, pas comme config options.
 //!
@@ -74,15 +74,19 @@ pub fn build_config_options(
 
 /// Capabilités annoncées à l'initialisation (spec §2.2).
 ///
-/// Reflète les handlers réellement implémentés : list/delete/fork/close.
+/// Reflète les handlers réellement implémentés : load/resume/list/delete/fork/close.
 pub fn build_agent_capabilities() -> AgentCapabilities {
-    AgentCapabilities::new().session_capabilities(
-        SessionCapabilities::new()
-            .list(SessionListCapabilities::new())
-            .delete(SessionDeleteCapabilities::new())
-            .close(SessionCloseCapabilities::new())
-            .fork(SessionForkCapabilities::new()), // unstable_session_fork — feature par défaut
-    )
+    AgentCapabilities::new()
+        // `session/load` est une capability top-level dans ACP v1.
+        .load_session(true)
+        .session_capabilities(
+            SessionCapabilities::new()
+                .list(SessionListCapabilities::new())
+                .delete(SessionDeleteCapabilities::new())
+                .resume(SessionResumeCapabilities::new())
+                .close(SessionCloseCapabilities::new())
+                .fork(SessionForkCapabilities::new()), // unstable_session_fork — feature par défaut
+        )
 }
 
 #[cfg(test)]
@@ -96,8 +100,9 @@ mod tests {
     }
 
     #[test]
-    fn build_agent_capabilities_inclut_fork() {
-        // Construction sans panique = capabilities correctement câblées.
-        let _caps = build_agent_capabilities();
+    fn build_agent_capabilities_active_load_et_resume() {
+        let caps = build_agent_capabilities();
+        assert!(caps.load_session);
+        assert!(caps.session_capabilities.resume.is_some());
     }
 }
