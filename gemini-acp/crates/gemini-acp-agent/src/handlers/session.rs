@@ -7,12 +7,9 @@
 //! UX principles borrowed from the mature Claude ACP adapter:
 //! - session mode state is returned on every lifecycle response;
 //! - loading replays history before resolving the request;
-//! - the session title is restored as an explicit `session/update`, so clients
-//!   can paint the conversation header before the first history chunk arrives;
-//! - mode changes emit `CurrentModeUpdate` immediately instead of requiring a
-//!   client refresh;
-//! - invalid lifecycle inputs are rejected as `invalid_params` rather than
-//!   leaking storage errors to the UI;
+//! - the session title is restored as an explicit `session/update`;
+//! - mode changes emit `CurrentModeUpdate` immediately;
+//! - invalid lifecycle inputs are rejected as `invalid_params`;
 //! - persisted tool_call/tool_result blocks are reconstructed into real ACP
 //!   tool cards during replay instead of disappearing from the conversation.
 
@@ -23,7 +20,7 @@ use tracing::warn;
 use gemini_acp_config::config::config_options::build_config_options;
 use gemini_acp_runtime::state::{Role, SessionMode as AcpSessionMode};
 use gemini_acp_runtime::tools::parse::parse_tool_calls;
-use gemini_acp_runtime::tools::tool_ux::{result_update, ToolInfo};
+use gemini_acp_runtime::tools::tool_ux::{bounded_raw_input, result_update, ToolInfo};
 use gemini_acp_runtime::AppState;
 
 fn is_valid_session_id(id: &str) -> bool {
@@ -81,6 +78,13 @@ fn send_restored_title(
     Ok(())
 }
 
+fn is_rejected_or_cancelled_tool_result(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("refusé par l'utilisateur")
+        || lower.contains("annulé par l'utilisateur")
+        || lower.contains("échec de la demande de permission acp")
+}
+
 fn replay_tool_result(
     cx: &ConnectionTo<Client>,
     session_id: &SessionId,
@@ -92,24 +96,28 @@ fn replay_tool_result(
 ) -> Result<(), AcpError> {
     let call_id = ToolCallId::from(format!("replay_call_{tool_call_index}"));
     let info = ToolInfo::build(tool_name, args, cwd, None);
+    let is_ok = result_text
+        .map(|text| !is_rejected_or_cancelled_tool_result(text))
+        .unwrap_or(false);
+
     cx.send_notification(SessionNotification::new(
         session_id.clone(),
         SessionUpdate::ToolCall(
             ToolCall::new(call_id.clone(), info.title.clone())
                 .kind(info.kind)
                 .status(if result_text.is_some() {
-                    ToolCallStatus::Completed
+                    if is_ok { ToolCallStatus::Completed } else { ToolCallStatus::Failed }
                 } else {
                     ToolCallStatus::InProgress
                 })
                 .content(info.content.clone())
                 .locations(info.locations.clone())
-                .raw_input(gemini_acp_runtime::tools::tool_ux::bounded_raw_input(args)),
+                .raw_input(bounded_raw_input(args)),
         ),
     ))?;
 
     if let Some(result_text) = result_text {
-        let rendered = result_update(tool_name, args, result_text, true, cwd, None);
+        let rendered = result_update(tool_name, args, result_text, is_ok, cwd, None);
         cx.send_notification(SessionNotification::new(
             session_id.clone(),
             SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
@@ -120,57 +128,6 @@ fn replay_tool_result(
                     .locations(rendered.locations),
             )),
         ))?;
-    }
-
-    Ok(())
-}
-
-/// Replay a persisted assistant message and its immediately-following tool results.
-///
-/// The current store persists textual `tool_call` and `tool_result` blocks. We
-/// deliberately use those blocks as the replay source instead of inventing a
-/// second persistence schema. This keeps replay faithful to what is already
-/// stored while restoring genuine ACP ToolCall / ToolCallUpdate events.
-fn replay_assistant_with_tools(
-    cx: &ConnectionTo<Client>,
-    session_id: &SessionId,
-    message_id: MessageId,
-    text: &str,
-    following_tool_results: &mut std::slice::Iter<'_, (Role, String)>,
-    cwd: &std::path::Path,
-    replay_index: &mut usize,
-) -> Result<(), AcpError> {
-    let (clean_text, calls) = parse_tool_calls(text);
-    if !clean_text.trim().is_empty() {
-        cx.send_notification(SessionNotification::new(
-            session_id.clone(),
-            SessionUpdate::AgentMessageChunk(
-                ContentChunk::new(ContentBlock::Text(TextContent::new(clean_text)))
-                    .message_id(message_id),
-            ),
-        ))?;
-    }
-
-    for call in calls {
-        let result = following_tool_results
-            .clone()
-            .find_map(|(role, text)| {
-                if *role == Role::Tool {
-                    Some(text.as_str())
-                } else {
-                    None
-                }
-            });
-        replay_tool_result(
-            cx,
-            session_id,
-            *replay_index,
-            &call.name,
-            &call.arguments,
-            result,
-            cwd,
-        )?;
-        *replay_index += 1;
     }
 
     Ok(())
@@ -263,8 +220,10 @@ pub async fn handle_load(
 
     let mut replay_index = 0usize;
     let mut index = 0usize;
+
     while index < session.messages.len() {
         let (role, text) = &session.messages[index];
+
         match role {
             Role::User => {
                 let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone())))
@@ -275,27 +234,8 @@ pub async fn handle_load(
                 ))?;
             }
             Role::Assistant => {
-                let (_, calls) = parse_tool_calls(text);
-                let mut result_cursor = index + 1;
-                let mut results = Vec::new();
-                while result_cursor < session.messages.len()
-                    && session.messages[result_cursor].0 == Role::Tool
-                    && results.len() < calls.len()
-                {
-                    results.push(session.messages[result_cursor].1.clone());
-                    result_cursor += 1;
-                }
-
-                let mut result_iter = results.iter().map(|text| (Role::Tool, text.clone())).collect::<Vec<_>>();
-                let mut result_refs = result_iter.iter().map(|entry| (&entry.0, &entry.1));
-                let mut tool_results = Vec::new();
-                while let Some((role, text)) = result_refs.next() {
-                    if *role == Role::Tool {
-                        tool_results.push(text.clone());
-                    }
-                }
-
                 let (clean_text, calls) = parse_tool_calls(text);
+
                 if !clean_text.trim().is_empty() {
                     let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(clean_text)))
                         .message_id(MessageId::from(format!("msg_{index}")));
@@ -305,8 +245,18 @@ pub async fn handle_load(
                     ))?;
                 }
 
+                let mut result_cursor = index + 1;
                 for (call_index, call) in calls.iter().enumerate() {
-                    let result_text = tool_results.get(call_index).map(String::as_str);
+                    let result_text = if result_cursor < session.messages.len()
+                        && session.messages[result_cursor].0 == Role::Tool
+                    {
+                        let result = session.messages[result_cursor].1.as_str();
+                        result_cursor += 1;
+                        Some(result)
+                    } else {
+                        None
+                    };
+
                     replay_tool_result(
                         cx,
                         &req.session_id,
@@ -317,15 +267,16 @@ pub async fn handle_load(
                         &session.cwd,
                     )?;
                     replay_index += 1;
+                    let _ = call_index;
                 }
 
                 index = result_cursor.saturating_sub(1);
             }
             Role::Tool => {
-                // Tool results are consumed together with the preceding assistant
-                // tool_call message so the client receives a coherent card.
+                // Consumed together with the preceding assistant tool_call block.
             }
         }
+
         index += 1;
     }
 
@@ -512,5 +463,12 @@ mod tests {
         let state = build_mode_state(AcpSessionMode::AcceptEdits);
         assert_eq!(state.current_mode_id.0, "accept_edits");
         assert_eq!(state.available_modes.len(), 3);
+    }
+
+    #[test]
+    fn rejected_tool_results_are_not_replayed_as_success() {
+        assert!(is_rejected_or_cancelled_tool_result("write (src/a.rs) refusé par l'utilisateur."));
+        assert!(is_rejected_or_cancelled_tool_result("échec de la demande de permission ACP : transport"));
+        assert!(!is_rejected_or_cancelled_tool_result("File Updated"));
     }
 }
