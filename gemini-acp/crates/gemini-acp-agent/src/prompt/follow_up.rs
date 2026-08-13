@@ -29,7 +29,11 @@ pub fn action_meta(label: &str, query: &str) -> Map<String, Value> {
                 "kind": "prompt",
                 "label": label,
                 "query": query,
-                "singleUse": true
+                "singleUse": true,
+                "dispatch": {
+                    "method": "session/prompt",
+                    "prompt": query
+                }
             }
         }),
     );
@@ -159,6 +163,8 @@ mod tests {
         assert_eq!(meta["geminiAcp"]["ui"]["action"], "follow_up");
         assert_eq!(meta["geminiAcp"]["ui"]["query"], "cargo test");
         assert_eq!(meta["geminiAcp"]["ui"]["singleUse"], true);
+        assert_eq!(meta["geminiAcp"]["ui"]["dispatch"]["method"], "session/prompt");
+        assert_eq!(meta["geminiAcp"]["ui"]["dispatch"]["prompt"], "cargo test");
     }
 
     #[test]
