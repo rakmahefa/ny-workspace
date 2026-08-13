@@ -1,95 +1,82 @@
-//! FollowUp handling for Gemini streams and ACP interactive elicitation.
+//! FollowUp handling for Gemini streams and ACP action choices.
 //!
-//! FollowUp is an agent-authored next-step action. ACP v1 does not expose a
-//! generic inline button component, so the action is presented through the
-//! standard client-side elicitation primitive, which existing ACP hosts know
-//! how to render and resolve interactively.
+//! FollowUp is NOT an executable tool. ACP v1 does not define a generic
+//! button component, so this module uses the stable `session/request_permission`
+//! interaction primitive to obtain an explicit user choice. The request is
+//! intentionally not routed through `ToolExecutor` and therefore never looks
+//! like a completed tool execution.
 
 use agent_client_protocol::schema::v1::{
-    CreateElicitationRequest, ElicitationAction, ElicitationContentValue,
-    ElicitationFormMode, ElicitationPropertySchema, ElicitationSchema,
-    ElicitationSessionScope, SessionId,
+    PermissionOption, PermissionOptionKind, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionId, SessionNotification, SessionUpdate,
+    ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
 };
 use agent_client_protocol::{Client, ConnectionTo};
-use serde_json::{json, Value};
+use serde_json::json;
 
 const FOLLOW_UP_MARKER: &str = "<FollowUp";
-const SKIP_VALUE: &str = "__followup_skip__";
-const SELECT_VALUE: &str = "__followup_select__";
+const SELECT_ID: &str = "followup_select";
+const SKIP_ID: &str = "followup_skip";
 
-/// Wait for the user to select or dismiss a FollowUp suggestion.
+/// Ask the host to present a real interactive FollowUp choice.
 ///
-/// Returns `Some(query)` when the user explicitly selects the action and
-/// `None` when the suggestion is dismissed/cancelled. The selected query can
-/// then be fed back into the current model turn without inventing a fake
-/// ToolCall execution.
+/// `Some(query)` means the user selected the suggested next step.
+/// `None` means the user dismissed/rejected it.
 pub async fn request_action(
     cx: &ConnectionTo<Client>,
     session_id: &SessionId,
     label: &str,
     query: &str,
 ) -> Result<Option<String>, String> {
-    let mut schema = ElicitationSchema::new();
-
-    let action_schema: ElicitationPropertySchema = serde_json::from_value(json!({
-        "type": "string",
-        "title": "Action",
-        "description": query,
-        "oneOf": [
-            {
-                "const": SELECT_VALUE,
-                "title": label,
-                "description": query
-            },
-            {
-                "const": SKIP_VALUE,
-                "title": "Ignorer",
-                "description": "Ne pas exécuter cette proposition."
-            }
-        ],
-        "_meta": {
+    let call_id = ToolCallId::from(format!("followup_{}", uuid::Uuid::new_v4().simple()));
+    let tool_call = ToolCall::new(call_id.clone(), format!("Follow-up · {}", truncate(label, 80)))
+        .status(ToolCallStatus::Pending)
+        .raw_input(json!({
+            "label": label,
+            "query": query,
+        }))
+        .meta(json!({
             "geminiAcp": {
-                "component": "follow_up_action",
+                "nonExecutionKind": "follow_up_action",
+                "ui": "choice",
                 "label": label,
                 "query": query,
-                "submitBehavior": "prompt"
             }
+        }));
+
+    let options = vec![
+        PermissionOption::new(SELECT_ID, label, PermissionOptionKind::AllowOnce),
+        PermissionOption::new(SKIP_ID, "Ignorer", PermissionOptionKind::RejectOnce),
+    ];
+
+    let request = RequestPermissionRequest::new(
+        session_id.clone(),
+        ToolCallUpdate::from(tool_call),
+        options,
+    )
+    .meta(json!({
+        "geminiAcp": {
+            "kind": "follow_up",
+            "action": "prompt",
+            "label": label,
+            "query": query,
+            "singleUse": true,
         }
-    }))
-    .map_err(|error| format!("invalid FollowUp elicitation schema: {error}"))?;
-
-    schema = schema.property("action", action_schema, true);
-
-    let mode = ElicitationFormMode::new(ElicitationSessionScope::new(session_id.clone()), schema);
-    let request = CreateElicitationRequest::new(
-        mode,
-        format!("{label}\n\n{query}"),
-    );
+    }));
 
     let response = cx
         .send_request(request)
         .block_task()
         .await
-        .map_err(|error| format!("ACP FollowUp elicitation failed: {error}"))?;
+        .map_err(|error| format!("ACP FollowUp action failed: {error}"))?;
 
-    match response.action {
-        ElicitationAction::Accept(accept) => {
-            let selected = accept
-                .content
-                .and_then(|content| content.get("action").cloned())
-                .and_then(|value| match value {
-                    ElicitationContentValue::String(value) => Some(value),
-                    _ => None,
-                });
-
-            match selected.as_deref() {
-                Some(SELECT_VALUE) => Ok(Some(query.to_owned())),
-                Some(SKIP_VALUE) | None => Ok(None),
-                Some(_) => Err("ACP returned an unknown FollowUp action value".into()),
-            }
+    match response.outcome {
+        RequestPermissionOutcome::Selected(selected) if selected.option_id.0 == SELECT_ID => {
+            Ok(Some(query.to_owned()))
         }
-        ElicitationAction::Decline | ElicitationAction::Cancel => Ok(None),
-        _ => Err("ACP returned an unsupported FollowUp elicitation action".into()),
+        RequestPermissionOutcome::Selected(selected) if selected.option_id.0 == SKIP_ID => Ok(None),
+        RequestPermissionOutcome::Cancelled => Ok(None),
+        other => Err(format!("unexpected FollowUp permission outcome: {other:?}")),
     }
 }
 
@@ -142,8 +129,8 @@ impl StreamNormalizer {
     }
 }
 
-/// FollowUp is parsed by the runtime parser. This compatibility helper keeps
-/// the old turn orchestration API while avoiding duplicate transformations.
+/// FollowUp is parsed by the runtime parser. Keep this helper for the existing
+/// turn orchestration API; it intentionally performs no UI transformation.
 pub fn replace_components(input: &str) -> String { input.to_owned() }
 
 fn partial_marker_len(input: &str) -> usize {
@@ -172,14 +159,19 @@ fn find_tag_end(input: &str) -> Option<usize> {
     None
 }
 
+fn truncate(value: &str, max: usize) -> String {
+    if value.chars().count() <= max { return value.to_owned(); }
+    format!("{}…", value.chars().take(max).collect::<String>())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn keeps_followup_values_stable() {
-        assert_eq!(SELECT_VALUE, "__followup_select__");
-        assert_eq!(SKIP_VALUE, "__followup_skip__");
+    fn follow_up_option_ids_are_stable() {
+        assert_eq!(SELECT_ID, "followup_select");
+        assert_eq!(SKIP_ID, "followup_skip");
     }
 
     #[test]
