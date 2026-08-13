@@ -31,7 +31,7 @@ use gemini_acp_runtime::state::{Role, Store, TurnError};
 use super::build::build_prompt;
 use super::content::blocks_to_parts;
 use super::error::{actionable_error_message, actionable_stream_error};
-use super::follow_up::{replace_components, StreamNormalizer};
+use super::follow_up::{emit_action, replace_components, StreamNormalizer};
 use super::notify::{notify_text, notify_usage};
 use super::title::derive_title;
 use gemini_acp_runtime::tools::executor::{emit_error_chunk, safe_session_update, ToolExecutor};
@@ -318,10 +318,30 @@ pub async fn run_turn(
         session.messages.push((Role::Assistant, assistant_history));
 
         let executor = ToolExecutor::new(&cx, &session_id, registry, &cwd, &additional_dirs, &mode_getter);
+        let mut follow_up_action_emitted = false;
         for call in &tool_calls {
             if *cancel.borrow() { return responder.respond(PromptResponse::new(StopReason::Cancelled)); }
+
+            if call.name == "FollowUp" {
+                let label = call.arguments.get("label").and_then(serde_json::Value::as_str).unwrap_or("Suggested next step").trim();
+                let query = call.arguments.get("query").and_then(serde_json::Value::as_str).unwrap_or("").trim();
+                if !label.is_empty() && !query.is_empty() {
+                    let _ = emit_action(&cx, &session_id, label, query);
+                    follow_up_action_emitted = true;
+                }
+                // FollowUp is an interaction, never an executable tool. It
+                // terminates the current model/tool round so the UI can wait
+                // for the user's click without asking Gemini for another turn.
+                break;
+            }
+
             let result = executor.execute(&call.name, &call.arguments).await;
             session.messages.push((Role::Tool, gemini_acp_runtime::tools::prompt::format_tool_result(&call.name, &result.content)));
+        }
+
+        if follow_up_action_emitted {
+            total_output = clean_text;
+            break;
         }
 
         if round == MAX_TURNS - 1 {
