@@ -1,16 +1,7 @@
 //! Persona Gemini — définition de la personnalité de l'agent.
 //!
 //! Ce module centralise la construction du prompt système pour l'agent
-//! Gemini ACP. Il définit :
-//!
-//! - **Persona par défaut** : assistant de codage intégré à Zed, concis et
-//!   pragmatique, avec des directives claires sur le format de sortie.
-//! - **Variantes** : `coding` (défaut), `creative`, `concise`, `custom`.
-//! - **Intégration** : utilisé par `prompt/build.rs` via `persona::system_prompt()`.
-//!
-//! La persona est sélectionnable par l'utilisateur via la clé de modèle
-//! suffixée, ex. `gemini-3.6-flash@persona=creative`. Si aucun suffixe n'est
-//! fourni, la persona `coding` est utilisée par défaut.
+//! Gemini ACP. Il définit la persona et les directives de sortie partagées.
 
 use crate::state::Session;
 
@@ -81,7 +72,7 @@ N'utilise les outils que si c'est strictement nécessaire.",
 
 pub fn system_prompt(session: &Session, persona: Option<Persona>) -> String {
     let p = persona.unwrap_or_default();
-    let mut system = String::with_capacity(1024);
+    let mut system = String::with_capacity(1600);
     system.push_str(&format!("[System instruction]: tu es un assistant {} intégré à Zed.\n", p.display_name().to_ascii_lowercase()));
     system.push_str(&format!("CWD: {}\n", session.cwd.display()));
     if !session.additional_directories.is_empty() {
@@ -94,7 +85,10 @@ pub fn system_prompt(session: &Session, persona: Option<Persona>) -> String {
     system.push_str("\
 - Le code doit être complet et exécutable.\n\
 - Utilise les outils (file_read, file_write, shell_exec, search) pour explorer le projet.\n\
-- Quand tu modifies un fichier, affiche le chemin et les lignes changées.");
+- Quand tu modifies un fichier, affiche le chemin et les lignes changées.\n\
+- Pour proposer une seule prochaine action claire à l'utilisateur, utilise exactement un composant `<FollowUp label=\"…\" query=\"…\" />` en fin de réponse.\n\
+- Le `label` est court et orienté action (ex. `Run tests`). Le `query` contient l'action que l'utilisateur déclencherait.\n\
+- N'utilise jamais plus d'un `<FollowUp>` par réponse et n'en génère pas si aucune prochaine action nette ne se dégage.");
     system.push_str("\n\n");
     system
 }
