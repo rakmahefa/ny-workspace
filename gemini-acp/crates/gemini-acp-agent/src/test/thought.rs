@@ -105,3 +105,16 @@ fn bare_double_newline_does_not_end_thought() {
         _ => false,
     }));
 }
+
+#[test]
+fn legacy_splitter_facade_preserves_existing_contract() {
+    let mut splitter = ThoughtSplitter::new(true);
+    let (thought, message) = splitter.feed("Réflexion suffisamment longue pour être émise");
+    assert!(!thought.is_empty());
+    assert!(message.is_empty());
+
+    let (thought, message) = splitter.feed("\n\n## Réponse\nVoici");
+    assert_eq!(thought, "");
+    assert_eq!(message, "\n\n## Réponse\nVoici");
+    assert!(splitter.has_emitted_thought());
+}
