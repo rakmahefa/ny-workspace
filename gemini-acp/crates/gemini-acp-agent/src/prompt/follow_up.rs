@@ -1,70 +1,89 @@
-//! FollowUp handling for Gemini streams and ACP UI actions.
+//! FollowUp handling for Gemini streams and ACP action choices.
 //!
-//! FollowUp is not an executable tool. It is an agent-authored next-step
-//! action that the ACP client should render as a clickable interaction.
+//! FollowUp is NOT an executable tool. ACP v1 does not define a generic
+//! button component, so this module uses the stable `session/request_permission`
+//! interaction primitive to obtain an explicit user choice. The request is
+//! intentionally not routed through `ToolExecutor` and therefore never looks
+//! like a completed tool execution.
 
-use serde_json::{json, Map, Value};
 use agent_client_protocol::schema::v1::{
-    Content, ContentBlock, SessionId, SessionNotification, SessionUpdate, TextContent,
-    ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolKind,
+    Content, ContentBlock, PermissionOption, PermissionOptionKind,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionId,
+    TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallStatus,
+    ToolCallUpdate, ToolKind,
 };
 use agent_client_protocol::{Client, ConnectionTo};
+use serde_json::json;
 
 const FOLLOW_UP_MARKER: &str = "<FollowUp";
+const SELECT_ID: &str = "followup_select";
+const SKIP_ID: &str = "followup_skip";
 
-/// ACP extension metadata consumed by FollowUp-aware clients.
+/// Ask the host to present a real interactive FollowUp choice.
 ///
-/// ACP v1 does not define a dedicated action component in `SessionUpdate`,
-/// so FollowUp uses the standard `tool_call` envelope with `pending` status
-/// plus `_meta.geminiAcp.ui.action` describing a non-executing prompt action.
-pub fn action_meta(label: &str, query: &str) -> Map<String, Value> {
-    let mut meta = Map::new();
-    meta.insert(
-        "geminiAcp".into(),
-        json!({
-            "nonExecutionKind": "action",
-            "ui": {
-                "component": "action",
-                "action": "follow_up",
-                "kind": "prompt",
-                "label": label,
-                "query": query,
-                "singleUse": true,
-                "dispatch": {
-                    "method": "session/prompt",
-                    "prompt": query
-                }
-            }
-        }),
-    );
-    meta
-}
-
-/// Emit a real interactive FollowUp action through the ACP session update
-/// channel. No permission is requested and no registry tool is executed.
-pub fn emit_action(
+/// `Some(query)` means the user selected the suggested next step.
+/// `None` means the user dismissed/rejected it.
+pub async fn request_action(
     cx: &ConnectionTo<Client>,
     session_id: &SessionId,
     label: &str,
     query: &str,
-) -> ToolCallId {
+) -> Result<Option<String>, String> {
     let call_id = ToolCallId::from(format!("followup_{}", uuid::Uuid::new_v4().simple()));
-    let title = format!("Follow-up · {}", truncate(label, 80));
-    let body = format!("**{}**\n\n{}\n\n_Select cette action pour envoyer cette proposition au modèle._", label, query);
-    let meta = action_meta(label, query);
+    let body = format!("**{}**\n\n{}\n\nChoisissez cette action pour envoyer la proposition au modèle.", label, query);
     let content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(TextContent::new(body))))];
-    let tool = ToolCall::new(call_id.clone(), title)
+
+    let tool_call = ToolCall::new(call_id.clone(), format!("Follow-up · {}", truncate(label, 80)))
         .kind(ToolKind::Other)
         .status(ToolCallStatus::Pending)
         .content(content)
-        .raw_input(json!({ "label": label, "query": query }))
-        .meta(meta);
+        .raw_input(json!({
+            "label": label,
+            "query": query,
+        }))
+        .meta(json!({
+            "geminiAcp": {
+                "nonExecutionKind": "follow_up_action",
+                "ui": "choice",
+                "label": label,
+                "query": query,
+            }
+        }).as_object().cloned().unwrap());
 
-    let _ = cx.send_notification(SessionNotification::new(
+    let options = vec![
+        PermissionOption::new(SELECT_ID, label, PermissionOptionKind::AllowOnce),
+        PermissionOption::new(SKIP_ID, "Ignorer", PermissionOptionKind::RejectOnce),
+    ];
+
+    let request = RequestPermissionRequest::new(
         session_id.clone(),
-        SessionUpdate::ToolCall(tool),
-    ));
-    call_id
+        ToolCallUpdate::from(tool_call),
+        options,
+    )
+    .meta(json!({
+        "geminiAcp": {
+            "kind": "follow_up",
+            "action": "prompt",
+            "label": label,
+            "query": query,
+            "singleUse": true,
+        }
+    }).as_object().cloned().unwrap());
+
+    let response = cx
+        .send_request(request)
+        .block_task()
+        .await
+        .map_err(|error| format!("ACP FollowUp action failed: {error}"))?;
+
+    match response.outcome {
+        RequestPermissionOutcome::Selected(selected) if selected.option_id.0 == SELECT_ID.into() => {
+            Ok(Some(query.to_owned()))
+        }
+        RequestPermissionOutcome::Selected(selected) if selected.option_id.0 == SKIP_ID.into() => Ok(None),
+        RequestPermissionOutcome::Cancelled => Ok(None),
+        other => Err(format!("unexpected FollowUp permission outcome: {other:?}")),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -116,8 +135,8 @@ impl StreamNormalizer {
     }
 }
 
-/// FollowUp is parsed by the runtime parser. This compatibility helper keeps
-/// the old turn orchestration API while avoiding duplicate transformations.
+/// FollowUp is parsed by the runtime parser. Keep this helper for the existing
+/// turn orchestration API; it intentionally performs no UI transformation.
 pub fn replace_components(input: &str) -> String { input.to_owned() }
 
 fn partial_marker_len(input: &str) -> usize {
@@ -156,15 +175,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn action_meta_is_non_executing_and_clickable() {
-        let meta = action_meta("Run tests", "cargo test");
-        assert_eq!(meta["geminiAcp"]["nonExecutionKind"], "action");
-        assert_eq!(meta["geminiAcp"]["ui"]["component"], "action");
-        assert_eq!(meta["geminiAcp"]["ui"]["action"], "follow_up");
-        assert_eq!(meta["geminiAcp"]["ui"]["query"], "cargo test");
-        assert_eq!(meta["geminiAcp"]["ui"]["singleUse"], true);
-        assert_eq!(meta["geminiAcp"]["ui"]["dispatch"]["method"], "session/prompt");
-        assert_eq!(meta["geminiAcp"]["ui"]["dispatch"]["prompt"], "cargo test");
+    fn follow_up_option_ids_are_stable() {
+        assert_eq!(SELECT_ID, "followup_select");
+        assert_eq!(SKIP_ID, "followup_skip");
     }
 
     #[test]

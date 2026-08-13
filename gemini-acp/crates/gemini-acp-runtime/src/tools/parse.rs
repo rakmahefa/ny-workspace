@@ -1,7 +1,8 @@
 //! Parsing normalisé des appels d'outils depuis les réponses texte Gemini.
 //!
-//! The parser turns fenced tool calls and Gemini's native `<FollowUp>`
-//! component into the same ACP-oriented `ParsedToolCall` representation.
+//! Les appels ordinaires sont des `Tool`; FollowUp est explicitement classé
+//! comme `Action` afin qu'aucune couche d'exécution générique ne le traite
+//! comme un outil exécutable.
 
 use serde_json::{json, Value};
 
@@ -9,10 +10,12 @@ use serde_json::{json, Value};
 pub enum ParsedToolKind {
     Tool,
     Elicitation,
+    Action,
 }
 
 impl ParsedToolKind {
     pub fn is_elicitation(self) -> bool { matches!(self, Self::Elicitation) }
+    pub fn is_action(self) -> bool { matches!(self, Self::Action) }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +35,7 @@ impl ParsedToolCall {
     }
 
     pub fn is_elicitation(&self) -> bool { self.kind.is_elicitation() }
+    pub fn is_action(&self) -> bool { self.kind.is_action() }
 
     pub fn to_history_block(&self) -> String {
         format!("```tool_call\n{}\n```", json!({"id": self.id, "name": self.name, "arguments": self.arguments}))
@@ -42,6 +46,7 @@ fn classify_tool_kind(name: &str) -> ParsedToolKind {
     let normalized = name.trim().to_ascii_lowercase().replace(['-', '_'], "");
     match normalized.as_str() {
         "askuserquestion" | "elicitation" | "askuser" => ParsedToolKind::Elicitation,
+        "followup" => ParsedToolKind::Action,
         _ => ParsedToolKind::Tool,
     }
 }
@@ -68,6 +73,8 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
     }
     clean = re_func_call.replace_all(&clean, "").trim().to_string();
 
+    // FollowUp is an action, not an executable tool. Parse at most one valid
+    // component and remove valid components from the user-visible text.
     let (without_follow_up, follow_up) = extract_follow_up(&clean);
     clean = without_follow_up;
     if let Some((label, query)) = follow_up {
@@ -149,22 +156,18 @@ fn parse_attributes(input: &str) -> std::collections::BTreeMap<String, String> {
     let mut attrs = std::collections::BTreeMap::new();
     let bytes = input.as_bytes();
     let mut index = 0;
-
     while index < bytes.len() {
         while index < bytes.len() && bytes[index].is_ascii_whitespace() { index += 1; }
         if index >= bytes.len() || bytes[index] == b'/' { break; }
-
         let key_start = index;
         while index < bytes.len() && !bytes[index].is_ascii_whitespace() && bytes[index] != b'=' { index += 1; }
         if key_start == index { index += 1; continue; }
         let key = &input[key_start..index];
-
         while index < bytes.len() && bytes[index].is_ascii_whitespace() { index += 1; }
         if index >= bytes.len() || bytes[index] != b'=' { break; }
         index += 1;
         while index < bytes.len() && bytes[index].is_ascii_whitespace() { index += 1; }
         if index >= bytes.len() { break; }
-
         let value = if bytes[index] == b'\'' || bytes[index] == b'"' {
             let quote = bytes[index];
             index += 1;
@@ -235,24 +238,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_follow_up_as_tool_call() {
-        let text = r#"Quel type de projet ? <FollowUp label="Initialiser un nouveau projet" query="Initialisons un nouveau projet dans cet espace de travail." />"#;
-        let (clean, calls) = parse_tool_calls(text);
-        assert_eq!(clean, "Quel type de projet ?");
+    fn classifies_follow_up_as_action() {
+        let (_, calls) = parse_tool_calls(r#"<FollowUp label="Run tests" query="cargo test" />"#);
         assert_eq!(calls.len(), 1);
+        assert!(calls[0].is_action());
+        assert!(!calls[0].is_elicitation());
         assert_eq!(calls[0].name, "FollowUp");
-        assert_eq!(calls[0].arguments["label"], "Initialiser un nouveau projet");
-        assert_eq!(calls[0].arguments["query"], "Initialisons un nouveau projet dans cet espace de travail.");
-    }
-
-    #[test]
-    fn parses_follow_up_with_reordered_attributes() {
-        let text = r#"<FollowUp query='cargo test' label='Run tests'/>"#;
-        let (clean, calls) = parse_tool_calls(text);
-        assert_eq!(clean, "");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].arguments["label"], "Run tests");
-        assert_eq!(calls[0].arguments["query"], "cargo test");
     }
 
     #[test]
@@ -277,6 +268,7 @@ mod tests {
         let text = r#"<FollowUp label="One" query="1" /><FollowUp label="Two" query="2" />"#;
         let (_, calls) = parse_tool_calls(text);
         assert_eq!(calls.len(), 1);
+        assert!(calls[0].is_action());
         assert_eq!(calls[0].arguments["label"], "One");
     }
 

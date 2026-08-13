@@ -31,7 +31,7 @@ use gemini_acp_runtime::state::{Role, Store, TurnError};
 use super::build::build_prompt;
 use super::content::blocks_to_parts;
 use super::error::{actionable_error_message, actionable_stream_error};
-use super::follow_up::{emit_action, replace_components, StreamNormalizer};
+use super::follow_up::{request_action, replace_components, StreamNormalizer};
 use super::notify::{notify_text, notify_usage};
 use super::title::derive_title;
 use gemini_acp_runtime::tools::executor::{emit_error_chunk, safe_session_update, ToolExecutor};
@@ -182,7 +182,7 @@ pub async fn run_turn(
                         agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(
                             TextContent::new(format!("Upload image {}/{} échoué: {e:#}", idx + 1, total)),
                         )),
-                    )];
+                                                        )];
                     safe_session_update(
                         &cx,
                         &session_id,
@@ -318,20 +318,26 @@ pub async fn run_turn(
         session.messages.push((Role::Assistant, assistant_history));
 
         let executor = ToolExecutor::new(&cx, &session_id, registry, &cwd, &additional_dirs, &mode_getter);
-        let mut follow_up_action_emitted = false;
+        let mut follow_up_seen = false;
+        let mut follow_up_selected = None;
+
         for call in &tool_calls {
             if *cancel.borrow() { return responder.respond(PromptResponse::new(StopReason::Cancelled)); }
 
             if call.name == "FollowUp" {
+                follow_up_seen = true;
                 let label = call.arguments.get("label").and_then(serde_json::Value::as_str).unwrap_or("Suggested next step").trim();
                 let query = call.arguments.get("query").and_then(serde_json::Value::as_str).unwrap_or("").trim();
                 if !label.is_empty() && !query.is_empty() {
-                    let _ = emit_action(&cx, &session_id, label, query);
-                    follow_up_action_emitted = true;
+                    match request_action(&cx, &session_id, label, query).await {
+                        Ok(selected) => follow_up_selected = selected,
+                        Err(error) => {
+                            emit_error_chunk(&cx, &session_id, &message_id, &format!("FollowUp interaction failed: {error}"));
+                        }
+                    }
                 }
-                // FollowUp is an interaction, never an executable tool. It
-                // terminates the current model/tool round so the UI can wait
-                // for the user's click without asking Gemini for another turn.
+                // FollowUp is an interactive action, never an executable tool.
+                // Stop processing additional calls in the same model emission.
                 break;
             }
 
@@ -339,7 +345,18 @@ pub async fn run_turn(
             session.messages.push((Role::Tool, gemini_acp_runtime::tools::prompt::format_tool_result(&call.name, &result.content)));
         }
 
-        if follow_up_action_emitted {
+        if follow_up_seen {
+            if let Some(query) = follow_up_selected {
+                // The click is a user decision. Feed the selected query back
+                // into the same ACP turn as the next user message, rather than
+                // fabricating a successful ToolCall result.
+                session.messages.push((Role::User, query));
+                total_output.clear();
+                continue;
+            }
+
+            // Dismissed/cancelled FollowUp: preserve the assistant's text and
+            // end the current turn normally.
             total_output = clean_text;
             break;
         }
