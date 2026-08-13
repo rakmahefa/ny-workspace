@@ -11,12 +11,13 @@
 //! - [`prompt`]    : injection `# Tool Use` dans le prompt + formatage historique.
 //! - [`sandbox`]   : validation de sécurité (path traversal, shell sandbox).
 //! - [`builtin`]   : outils intégrés.
-//! - [`interactive`] : outils qui utilisent directement les capacités interactives ACP.
+//! - [`interactive`] : façade stable vers l'implémentation interactive ACP.
 
 pub mod builtin;
 pub mod elicitation;
 pub mod executor;
-pub mod interactive;
+mod interactive_v2;
+pub use interactive_v2 as interactive;
 pub mod lifecycle;
 pub mod parse;
 pub mod prompt;
