@@ -261,7 +261,7 @@ pub async fn run_turn(
         let is_thinking_model = gemini_acp_config::core::models::resolve(&session.model, gemini_acp_config::core::models::DEFAULT_MODEL)
             .map(|r| gemini_acp_config::core::models::is_thinking_mode(r.mode))
             .unwrap_or(false);
-        let mut splitter = crate::thought::ThoughtSplitter::new(is_thinking_model);
+        let mut thought_stream = crate::thought::ThoughtStream::new(is_thinking_model);
         let mut follow_up_stream = StreamNormalizer::default();
         let mut assistant = String::new();
         let outcome = loop {
@@ -271,12 +271,20 @@ pub async fn run_turn(
                     let Some(item) = item else { break TurnOutcome::Complete };
                     match item {
                         Ok(delta) => {
-                            assistant.push_str(&delta);
-                            let (thought, message) = splitter.feed(&delta);
-                            if !thought.is_empty() { crate::thought::notify_thought(&cx, &session_id, &message_id, thought).await?; }
-                            if !message.is_empty() {
-                                let safe_message = follow_up_stream.push(&message);
-                                if !safe_message.is_empty() { notify_text(&cx, &session_id, &message_id, safe_message)?; }
+                            for event in thought_stream.feed(&delta) {
+                                match event {
+                                    crate::thought::ThoughtEvent::ThoughtChunk(text) => {
+                                        crate::thought::notify_thought(&cx, &session_id, &message_id, &text).await?;
+                                    }
+                                    crate::thought::ThoughtEvent::ThoughtEnd => {}
+                                    crate::thought::ThoughtEvent::ResponseChunk(text) => {
+                                        assistant.push_str(&text);
+                                        let safe_message = follow_up_stream.push(&text);
+                                        if !safe_message.is_empty() {
+                                            notify_text(&cx, &session_id, &message_id, safe_message)?;
+                                        }
+                                    }
+                                }
                             }
                         }
                         Err(e) => break TurnOutcome::Failed(e),
@@ -286,11 +294,20 @@ pub async fn run_turn(
         };
         drop(rx);
 
-        let (thought, message) = splitter.flush();
-        if !thought.is_empty() { crate::thought::notify_thought(&cx, &session_id, &message_id, thought).await?; }
-        if !message.is_empty() {
-            let safe_message = follow_up_stream.push(&message);
-            if !safe_message.is_empty() { notify_text(&cx, &session_id, &message_id, safe_message)?; }
+        for event in thought_stream.finish() {
+            match event {
+                crate::thought::ThoughtEvent::ThoughtChunk(text) => {
+                    crate::thought::notify_thought(&cx, &session_id, &message_id, &text).await?;
+                }
+                crate::thought::ThoughtEvent::ThoughtEnd => {}
+                crate::thought::ThoughtEvent::ResponseChunk(text) => {
+                    assistant.push_str(&text);
+                    let safe_message = follow_up_stream.push(&text);
+                    if !safe_message.is_empty() {
+                        notify_text(&cx, &session_id, &message_id, safe_message)?;
+                    }
+                }
+            }
         }
         let follow_up_tail = follow_up_stream.finish();
         if !follow_up_tail.is_empty() { notify_text(&cx, &session_id, &message_id, follow_up_tail)?; }
