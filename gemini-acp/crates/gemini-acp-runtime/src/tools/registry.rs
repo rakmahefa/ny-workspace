@@ -83,8 +83,6 @@ impl ToolRegistry {
         self.register(Box::new(crate::tools::builtin::file::FileWriteTool));
         self.register(Box::new(crate::tools::builtin::file::FileEditTool));
         self.register(Box::new(crate::tools::builtin::filesystem::GlobTool));
-        self.register(Box::new(crate::tools::builtin::filesystem::ListDirectoryTool));
-        self.register(Box::new(crate::tools::builtin::follow_up::FollowUpTool));
         self.register(Box::new(crate::tools::builtin::shell::ShellExecTool));
         self.register(Box::new(crate::tools::builtin::search::SearchTool));
         self.register(Box::new(crate::tools::builtin::composed::SearchAndReadTool));
@@ -122,19 +120,13 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
-    fn registry_builtin_has_all_phases() {
+    fn registry_builtin_has_executable_tools_only() {
         let reg = ToolRegistry::builtin();
         let defs = reg.definitions();
         let names: Vec<&str> = defs.iter().filter_map(|d| d.get("name").and_then(Value::as_str)).collect();
-        for expected in ["file_read", "file_write", "file_edit", "glob", "list_directory", "FollowUp", "shell_exec", "search", "search_and_read", "replace_in_file", "AskUserQuestion"] { assert!(names.contains(&expected), "missing {expected}"); }
-    }
-
-    #[test]
-    fn follow_up_is_registered_as_builtin() {
-        let reg = ToolRegistry::builtin();
-        assert!(reg.definitions().iter().any(|definition| definition.get("name") == Some(&Value::String("FollowUp".into()))));
+        for expected in ["file_read", "file_write", "file_edit", "glob", "shell_exec", "search", "search_and_read", "replace_in_file", "AskUserQuestion"] { assert!(names.contains(&expected), "missing {expected}"); }
+        assert!(!names.contains(&"FollowUp"), "FollowUp must not be an executable tool");
     }
 }
