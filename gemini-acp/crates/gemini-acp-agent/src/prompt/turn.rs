@@ -178,13 +178,41 @@ pub async fn run_turn(
             match client.upload_image(b64, mime).await {
                 Ok(r) => refs.push(r),
                 Err(e) => {
-                    safe_session_update(&cx, &session_id, SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(upload_call_id.clone(), ToolCallUpdateFields::new().status(ToolCallStatus::Failed).content(vec![ToolCallContent::Content(agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(TextContent::new(format!("Upload image {}/{} échoué: {e:#}", idx + 1, total))))])))));
+                    let content = vec![ToolCallContent::Content(
+                        agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(
+                            TextContent::new(format!("Upload image {}/{} échoué: {e:#}", idx + 1, total)),
+                        )),
+                    )];
+                    safe_session_update(
+                        &cx,
+                        &session_id,
+                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                            upload_call_id.clone(),
+                            ToolCallUpdateFields::new()
+                                .status(ToolCallStatus::Failed)
+                                .content(content),
+                        )),
+                    );
                     span.record("outcome", "refusal_upload");
                     return responder.respond(PromptResponse::new(StopReason::Refusal));
                 }
             }
         }
-        safe_session_update(&cx, &session_id, SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(upload_call_id, ToolCallUpdateFields::new().status(ToolCallStatus::Completed).content(vec![ToolCallContent::Content(agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(TextContent::new(format!("{total} image(s) uploadée(s) avec succès"))))])))));
+        let content = vec![ToolCallContent::Content(
+            agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(
+                TextContent::new(format!("{total} image(s) uploadée(s) avec succès")),
+            )),
+        )];
+        safe_session_update(
+            &cx,
+            &session_id,
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                upload_call_id,
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::Completed)
+                    .content(content),
+            )),
+        );
     }
 
     session.messages.push((Role::User, user_text.clone()));
@@ -247,7 +275,7 @@ pub async fn run_turn(
                             let (thought, message) = splitter.feed(&delta);
                             if !thought.is_empty() { crate::thought::notify_thought(&cx, &session_id, &message_id, thought).await?; }
                             if !message.is_empty() {
-                                let safe_message = follow_up_stream.push(message);
+                                let safe_message = follow_up_stream.push(&message);
                                 if !safe_message.is_empty() { notify_text(&cx, &session_id, &message_id, safe_message)?; }
                             }
                         }
@@ -261,7 +289,7 @@ pub async fn run_turn(
         let (thought, message) = splitter.flush();
         if !thought.is_empty() { crate::thought::notify_thought(&cx, &session_id, &message_id, thought).await?; }
         if !message.is_empty() {
-            let safe_message = follow_up_stream.push(message);
+            let safe_message = follow_up_stream.push(&message);
             if !safe_message.is_empty() { notify_text(&cx, &session_id, &message_id, safe_message)?; }
         }
         let follow_up_tail = follow_up_stream.finish();

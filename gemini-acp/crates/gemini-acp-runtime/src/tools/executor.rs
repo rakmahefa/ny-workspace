@@ -320,7 +320,7 @@ fn permission_meta(request: &PermissionRequest) -> Map<String, Value> {
 fn lifecycle_meta(tool_name: &str, lifecycle: &ToolLifecycle, non_execution_kind: Option<&str>, terminal_meta: Option<Map<String, Value>>) -> Map<String, Value> {
     let mut meta = terminal_meta.unwrap_or_default();
     meta.insert("geminiAcp".into(), json!({ "lifecycle": { "state": lifecycle_state_label(lifecycle.state()), "sequence": lifecycle.sequence() } }));
-    let claude = meta.entry("claudeCode".into()).or_insert_with(|| json!({}));
+    let claude = meta.entry("claudeCode").or_insert_with(|| json!({}));
     if let Some(object) = claude.as_object_mut() {
         if !tool_name.is_empty() { object.insert("toolName".into(), Value::String(tool_name.to_owned())); }
         if let Some(reason) = non_execution_kind { object.insert("nonExecutionKind".into(), Value::String(reason.to_owned())); }
