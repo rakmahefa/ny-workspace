@@ -1,13 +1,8 @@
 //! Encapsulation du flux `thinking` Gemini → ACP.
 //!
-//! Le parseur est volontairement indépendant du transport Gemini et de la couche
-//! ACP. Il transforme un flux de deltas en événements sémantiques : pensée,
+//! Le parseur est indépendant du transport Gemini et de la couche ACP. Il
+//! transforme un flux de deltas en événements sémantiques : pensée,
 //! transition vers la réponse, ou réponse.
-//!
-//! Cette séparation suit le principe de `claude-agent-acp` : le cycle d'un tour
-//! est piloté par un état explicite, plutôt que par un simple post-traitement du
-//! texte produit. Le consommateur ACP n'a donc pas à connaître les marqueurs
-//! Gemini ni à mélanger thinking et réponse.
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, MessageId, SessionId, SessionNotification, SessionUpdate,
@@ -15,11 +10,8 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Client, ConnectionTo, Error as AcpError};
 
-/// Fenêtre maximale conservée pour reconnaître un marqueur arrivé coupé entre
-/// plusieurs deltas réseau. Le plus long marqueur supporté est `</thinking>`.
 const MARKER_LOOKBEHIND: usize = 32;
 
-/// Phase sémantique du flux d'un tour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThoughtPhase {
     Response,
@@ -27,7 +19,6 @@ pub enum ThoughtPhase {
     Completed,
 }
 
-/// Événement produit par [`ThoughtStream`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThoughtEvent {
     ThoughtChunk(String),
@@ -35,7 +26,6 @@ pub enum ThoughtEvent {
     ResponseChunk(String),
 }
 
-/// Adaptateur du flux texte Gemini vers un flux d'événements sémantiques.
 #[derive(Debug)]
 pub struct ThoughtStream {
     phase: ThoughtPhase,
@@ -44,7 +34,6 @@ pub struct ThoughtStream {
 }
 
 impl ThoughtStream {
-    /// Initialise le flux. Les modèles non-thinking sont directement en réponse.
     pub fn new(is_thinking_model: bool) -> Self {
         Self {
             phase: if is_thinking_model {
@@ -65,7 +54,6 @@ impl ThoughtStream {
         self.emitted_thought
     }
 
-    /// Ingère un delta et retourne uniquement les événements causés par ce delta.
     pub fn feed(&mut self, delta: &str) -> Vec<ThoughtEvent> {
         if delta.is_empty() || self.phase == ThoughtPhase::Completed {
             return Vec::new();
@@ -116,9 +104,6 @@ impl ThoughtStream {
         Vec::new()
     }
 
-    /// Termine le flux. Le reliquat d'une pensée ouverte reste une pensée ; la
-    /// couche de tour décide ensuite si l'absence de réponse constitue une
-    /// divergence ou une réponse valide.
     pub fn finish(&mut self) -> Vec<ThoughtEvent> {
         if self.phase == ThoughtPhase::Completed {
             return Vec::new();
@@ -127,8 +112,8 @@ impl ThoughtStream {
         let mut events = Vec::new();
         let pending = std::mem::take(&mut self.pending);
         if !pending.is_empty() {
-            self.emitted_thought = true;
             if self.phase == ThoughtPhase::Thinking {
+                self.emitted_thought = true;
                 events.push(ThoughtEvent::ThoughtChunk(pending));
             } else {
                 events.push(ThoughtEvent::ResponseChunk(pending));
@@ -149,6 +134,54 @@ impl ThoughtStream {
                 break;
             }
         }
+    }
+}
+
+/// Compatibilité temporaire pour les consommateurs existants.
+///
+/// La nouvelle orchestration doit consommer `ThoughtStream` directement. Ce
+/// wrapper conserve toutefois le contrat historique `(thought, message)` afin
+/// que la migration puisse être faite sans rupture intermédiaire.
+#[derive(Debug)]
+pub struct ThoughtSplitter {
+    stream: ThoughtStream,
+}
+
+impl ThoughtSplitter {
+    pub fn new(is_thinking_model: bool) -> Self {
+        Self {
+            stream: ThoughtStream::new(is_thinking_model),
+        }
+    }
+
+    pub fn feed(&mut self, delta: &str) -> (String, String) {
+        let mut thought = String::new();
+        let mut message = String::new();
+        for event in self.stream.feed(delta) {
+            match event {
+                ThoughtEvent::ThoughtChunk(text) => thought.push_str(&text),
+                ThoughtEvent::ResponseChunk(text) => message.push_str(&text),
+                ThoughtEvent::ThoughtEnd => {}
+            }
+        }
+        (thought, message)
+    }
+
+    pub fn flush(&mut self) -> (String, String) {
+        let mut thought = String::new();
+        let mut message = String::new();
+        for event in self.stream.finish() {
+            match event {
+                ThoughtEvent::ThoughtChunk(text) => thought.push_str(&text),
+                ThoughtEvent::ResponseChunk(text) => message.push_str(&text),
+                ThoughtEvent::ThoughtEnd => {}
+            }
+        }
+        (thought, message)
+    }
+
+    pub fn has_emitted_thought(&self) -> bool {
+        self.stream.has_emitted_thought()
     }
 }
 
@@ -182,7 +215,6 @@ fn find_thought_end(buffer: &str) -> Option<(usize, usize, bool)> {
     None
 }
 
-/// Émet un chunk ACP de pensée avec le même `message_id` que le tour.
 pub async fn notify_thought(
     cx: &ConnectionTo<Client>,
     session_id: &SessionId,
