@@ -182,7 +182,7 @@ pub async fn run_turn(
                         agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(
                             TextContent::new(format!("Upload image {}/{} échoué: {e:#}", idx + 1, total)),
                         )),
-                                                        )];
+                    )];
                     safe_session_update(
                         &cx,
                         &session_id,
@@ -264,6 +264,7 @@ pub async fn run_turn(
         let mut thought_stream = crate::thought::ThoughtStream::new(is_thinking_model);
         let mut follow_up_stream = StreamNormalizer::default();
         let mut assistant = String::new();
+        let mut tool_detection_text = String::new();
         let outcome = loop {
             tokio::select! {
                 _ = cancel.changed() => break TurnOutcome::Cancelled,
@@ -274,10 +275,12 @@ pub async fn run_turn(
                             for event in thought_stream.feed(&delta) {
                                 match event {
                                     crate::thought::ThoughtEvent::ThoughtChunk(text) => {
+                                        tool_detection_text.push_str(&text);
                                         crate::thought::notify_thought(&cx, &session_id, &message_id, &text).await?;
                                     }
                                     crate::thought::ThoughtEvent::ThoughtEnd => {}
                                     crate::thought::ThoughtEvent::ResponseChunk(text) => {
+                                        tool_detection_text.push_str(&text);
                                         assistant.push_str(&text);
                                         let safe_message = follow_up_stream.push(&text);
                                         if !safe_message.is_empty() {
@@ -297,10 +300,12 @@ pub async fn run_turn(
         for event in thought_stream.finish() {
             match event {
                 crate::thought::ThoughtEvent::ThoughtChunk(text) => {
+                    tool_detection_text.push_str(&text);
                     crate::thought::notify_thought(&cx, &session_id, &message_id, &text).await?;
                 }
                 crate::thought::ThoughtEvent::ThoughtEnd => {}
                 crate::thought::ThoughtEvent::ResponseChunk(text) => {
+                    tool_detection_text.push_str(&text);
                     assistant.push_str(&text);
                     let safe_message = follow_up_stream.push(&text);
                     if !safe_message.is_empty() {
@@ -322,7 +327,8 @@ pub async fn run_turn(
             return responder.respond(PromptResponse::new(map_stop_reason_from_error(e)));
         }
 
-        let (clean_text, tool_calls) = parse_tool_calls(&assistant);
+        let (clean_text, _) = parse_tool_calls(&assistant);
+        let (_, tool_calls) = parse_tool_calls(&tool_detection_text);
         let clean_text = replace_components(&clean_text);
         if tool_calls.is_empty() || !session.tools_enabled || !registry.has_tools() {
             total_output = clean_text;
@@ -353,8 +359,6 @@ pub async fn run_turn(
                         }
                     }
                 }
-                // FollowUp is an interactive action, never an executable tool.
-                // Stop processing additional calls in the same model emission.
                 break;
             }
 
@@ -364,16 +368,11 @@ pub async fn run_turn(
 
         if follow_up_seen {
             if let Some(query) = follow_up_selected {
-                // The click is a user decision. Feed the selected query back
-                // into the same ACP turn as the next user message, rather than
-                // fabricating a successful ToolCall result.
                 session.messages.push((Role::User, query));
                 total_output.clear();
                 continue;
             }
 
-            // Dismissed/cancelled FollowUp: preserve the assistant's text and
-            // end the current turn normally.
             total_output = clean_text;
             break;
         }
