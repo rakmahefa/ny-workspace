@@ -3,7 +3,6 @@
 //! FollowUp is not an executable tool. It is an agent-authored next-step
 //! action that the ACP client should render as a clickable interaction.
 
-use std::collections::BTreeMap;
 use serde_json::{json, Map, Value};
 use agent_client_protocol::schema::v1::{
     Content, ContentBlock, SessionId, SessionNotification, SessionUpdate, TextContent,
