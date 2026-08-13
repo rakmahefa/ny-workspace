@@ -1,8 +1,7 @@
 //! Builtin FollowUp tool.
 //!
 //! FollowUp is an agent-authored next-step action. It has no side effects and
-//! exists so ACP clients can render it through the same ToolCall/tool_ux
-//! pipeline as every other builtin.
+//! is rendered through the normal ACP ToolCall/tool_ux pipeline.
 
 use std::path::{Path, PathBuf};
 
@@ -56,20 +55,7 @@ impl Tool for FollowUpTool {
             _ => return ToolResult::Err("FollowUp: parameter 'query' is required and must not be empty".into()),
         };
 
-        Ok(json!({
-            "label": label,
-            "query": query
-        }).to_string())
-            .into()
-    }
-}
-
-impl From<Result<String, String>> for ToolResult {
-    fn from(value: Result<String, String>) -> Self {
-        match value {
-            Ok(value) => ToolResult::Ok(value),
-            Err(error) => ToolResult::Err(error),
-        }
+        ToolResult::Ok(json!({"label": label, "query": query}).to_string())
     }
 }
 
