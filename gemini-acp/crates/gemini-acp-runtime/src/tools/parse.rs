@@ -28,8 +28,13 @@ pub struct ParsedToolCall {
 
 impl ParsedToolCall {
     pub fn new(id: impl Into<String>, name: impl Into<String>, arguments: Value) -> Self {
-        let name = name.into();
-        let kind = classify_tool_kind(&name);
+        let original_name = name.into();
+        let kind = classify_tool_kind(&original_name);
+        let name = if kind.is_elicitation() {
+            "AskUserQuestion".to_owned()
+        } else {
+            original_name
+        };
         Self { id: id.into(), name, arguments, kind }
     }
 
@@ -154,10 +159,11 @@ mod tests {
     }
 
     #[test]
-    fn detects_gemini_elicitation() {
-        let text = "```function_call\n{\"name\":\"AskUserQuestion\",\"args\":{\"questions\":[{\"question\":\"Quel langage ?\",\"options\":[{\"label\":\"Rust\"}]}]}}\n```";
+    fn detects_and_normalizes_gemini_elicitation() {
+        let text = "```function_call\n{\"name\":\"ask_user_question\",\"args\":{\"questions\":[{\"question\":\"Quel langage ?\",\"options\":[{\"label\":\"Rust\"}]}]}}\n```";
         let (_, calls) = parse_tool_calls(text);
         assert!(calls[0].is_elicitation());
+        assert_eq!(calls[0].name, "AskUserQuestion");
     }
 
     #[test]
