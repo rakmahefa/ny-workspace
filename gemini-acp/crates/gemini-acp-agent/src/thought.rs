@@ -1,26 +1,8 @@
-//! Gestion du flux `thinking` Gemini → ACP.
+//! Encapsulation du flux `thinking` Gemini → ACP.
 //!
-//! Le pattern retenu suit le modèle ACP de `claude-agent-acp` : la pensée et
-//! le message utilisateur sont traités comme deux flux logiques distincts et
-//! chaque morceau de pensée est immédiatement traduit en
-//! `SessionUpdate::AgentThoughtChunk`.
-//!
-//! Le backend Gemini utilisé par ce projet expose aujourd'hui un flux texte
-//! aplati. Tant qu'il ne fournit pas de champ `thought` structuré au niveau du
-//! transport, ce module fournit donc un *fallback* déterministe :
-//!
-//! - les modèles thinking entrent en état `Thinking` ;
-//! - `</think>` / `</thinking>` terminent explicitement la pensée ;
-//! - les séparateurs Markdown historiques (`#`, `##`, `###`, `####`, `**...**`)
-//!   restent supportés pour compatibilité ;
-//! - la pensée est émise progressivement avec une petite fenêtre de garde afin
-//!   de reconnaître un marqueur qui arrive coupé entre plusieurs deltas ;
-//! - après la transition, les deltas sont toujours envoyés directement comme
-//!   `agent_message_chunk`.
-//!
-//! Lorsque Gemini fournira un indicateur de pensée structuré dans son flux web,
-//! cette machine d'état pourra être remplacée par un mapping direct sans
-//! modifier la couche ACP qui consomme `notify_thought`.
+//! Le parseur est indépendant du transport Gemini et de la couche ACP. Il
+//! transforme un flux de deltas en événements sémantiques : pensée,
+//! transition vers la réponse, ou réponse.
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, MessageId, SessionId, SessionNotification, SessionUpdate,
@@ -28,78 +10,81 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Client, ConnectionTo, Error as AcpError};
 
-/// Longueur maximale conservée afin de reconnaître un marqueur arrivé coupé
-/// entre deux deltas réseau. Le plus long marqueur supporté est `</thinking>`.
 const MARKER_LOOKBEHIND: usize = 32;
 
-/// État logique du flux retourné par Gemini.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ThoughtState {
-    Thinking,
+pub enum ThoughtPhase {
     Response,
+    Thinking,
+    Completed,
 }
 
-#[derive(Debug, Default)]
-pub struct ThoughtSplitter {
-    state: ThoughtState,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThoughtEvent {
+    ThoughtChunk(String),
+    ThoughtEnd,
+    ResponseChunk(String),
+}
+
+#[derive(Debug)]
+pub struct ThoughtStream {
+    phase: ThoughtPhase,
     pending: String,
-    has_emitted_thought: bool,
+    emitted_thought: bool,
 }
 
-impl Default for ThoughtState {
-    fn default() -> Self {
-        Self::Response
-    }
-}
-
-impl ThoughtSplitter {
-    /// Construit le parseur. `is_thinking_model` active le mode pensée pour le
-    /// tour courant ; un modèle classique reste un simple flux texte.
+impl ThoughtStream {
     pub fn new(is_thinking_model: bool) -> Self {
         Self {
-            state: if is_thinking_model {
-                ThoughtState::Thinking
+            phase: if is_thinking_model {
+                ThoughtPhase::Thinking
             } else {
-                ThoughtState::Response
+                ThoughtPhase::Response
             },
             pending: String::new(),
-            has_emitted_thought: false,
+            emitted_thought: false,
         }
     }
 
-    /// Ingest un delta de stream et retourne `(thought_delta, message_delta)`.
-    ///
-    /// Contrairement à l'ancien splitter, cette fonction n'attend pas toute la
-    /// réponse : elle émet immédiatement la majeure partie de la pensée et ne
-    /// conserve qu'une petite fenêtre pour détecter les marqueurs inter-deltas.
-    pub fn feed(&mut self, delta: &str) -> (String, String) {
-        if delta.is_empty() {
-            return (String::new(), String::new());
+    pub fn phase(&self) -> ThoughtPhase {
+        self.phase
+    }
+
+    pub fn has_emitted_thought(&self) -> bool {
+        self.emitted_thought
+    }
+
+    pub fn feed(&mut self, delta: &str) -> Vec<ThoughtEvent> {
+        if delta.is_empty() || self.phase == ThoughtPhase::Completed {
+            return Vec::new();
         }
 
-        if self.state == ThoughtState::Response {
-            return (String::new(), delta.to_string());
+        if self.phase == ThoughtPhase::Response {
+            return vec![ThoughtEvent::ResponseChunk(delta.to_owned())];
         }
 
         self.pending.push_str(delta);
         self.consume_open_marker();
 
         if let Some((idx, marker_len, keep_marker)) = find_thought_end(&self.pending) {
-            let thought = self.pending[..idx].to_string();
+            let thought = self.pending[..idx].to_owned();
             let message_start = if keep_marker { idx } else { idx + marker_len };
-            let message = self.pending[message_start..].to_string();
+            let message = self.pending[message_start..].to_owned();
             self.pending.clear();
-            self.state = ThoughtState::Response;
+            self.phase = ThoughtPhase::Response;
 
+            let mut events = Vec::with_capacity(3);
             if !thought.is_empty() {
-                self.has_emitted_thought = true;
+                self.emitted_thought = true;
+                events.push(ThoughtEvent::ThoughtChunk(thought));
             }
-            return (thought, message);
+            events.push(ThoughtEvent::ThoughtEnd);
+            if !message.is_empty() {
+                events.push(ThoughtEvent::ResponseChunk(message));
+            }
+            return events;
         }
 
-        // Flux continu : émettre tout sauf une petite fenêtre de look-behind.
-        // Cette fenêtre évite de couper `</think>` ou une variante Markdown
-        // juste avant qu'elle ne soit complétée par le delta suivant.
         if self.pending.chars().count() > MARKER_LOOKBEHIND {
             let emit_chars = self.pending.chars().count() - MARKER_LOOKBEHIND;
             let split_at = self
@@ -108,48 +93,98 @@ impl ThoughtSplitter {
                 .nth(emit_chars)
                 .map(|(idx, _)| idx)
                 .unwrap_or(self.pending.len());
-            let thought = self.pending[..split_at].to_string();
+            let thought = self.pending[..split_at].to_owned();
             self.pending.drain(..split_at);
             if !thought.is_empty() {
-                self.has_emitted_thought = true;
+                self.emitted_thought = true;
+                return vec![ThoughtEvent::ThoughtChunk(thought)];
             }
-            return (thought, String::new());
         }
 
-        (String::new(), String::new())
+        Vec::new()
     }
 
-    /// Termine le flux et restitue le reliquat non encore émis.
-    pub fn flush(&mut self) -> (String, String) {
-        if self.state == ThoughtState::Response {
-            let message = std::mem::take(&mut self.pending);
-            return (String::new(), message);
+    pub fn finish(&mut self) -> Vec<ThoughtEvent> {
+        if self.phase == ThoughtPhase::Completed {
+            return Vec::new();
         }
 
-        let thought = std::mem::take(&mut self.pending);
-        self.state = ThoughtState::Response;
-        if !thought.is_empty() {
-            self.has_emitted_thought = true;
+        let mut events = Vec::new();
+        let pending = std::mem::take(&mut self.pending);
+        if !pending.is_empty() {
+            if self.phase == ThoughtPhase::Thinking {
+                self.emitted_thought = true;
+                events.push(ThoughtEvent::ThoughtChunk(pending));
+            } else {
+                events.push(ThoughtEvent::ResponseChunk(pending));
+            }
         }
-        (thought, String::new())
-    }
 
-    #[allow(dead_code)]
-    pub fn has_emitted_thought(&self) -> bool {
-        self.has_emitted_thought
+        if self.phase == ThoughtPhase::Thinking {
+            events.push(ThoughtEvent::ThoughtEnd);
+        }
+        self.phase = ThoughtPhase::Completed;
+        events
     }
 
     fn consume_open_marker(&mut self) {
         for marker in ["<think>", "<thinking>"] {
             if let Some(rest) = self.pending.strip_prefix(marker) {
-                self.pending = rest.to_string();
+                self.pending = rest.to_owned();
                 break;
             }
         }
     }
 }
 
-/// Retourne `(index, longueur_marqueur, garder_marqueur_dans_message)`.
+/// Compatibilité temporaire pour les consommateurs existants.
+///
+/// La nouvelle orchestration doit consommer `ThoughtStream` directement. Ce
+/// wrapper conserve toutefois le contrat historique `(thought, message)` afin
+/// que la migration puisse être faite sans rupture intermédiaire.
+#[derive(Debug)]
+pub struct ThoughtSplitter {
+    stream: ThoughtStream,
+}
+
+impl ThoughtSplitter {
+    pub fn new(is_thinking_model: bool) -> Self {
+        Self {
+            stream: ThoughtStream::new(is_thinking_model),
+        }
+    }
+
+    pub fn feed(&mut self, delta: &str) -> (String, String) {
+        let mut thought = String::new();
+        let mut message = String::new();
+        for event in self.stream.feed(delta) {
+            match event {
+                ThoughtEvent::ThoughtChunk(text) => thought.push_str(&text),
+                ThoughtEvent::ResponseChunk(text) => message.push_str(&text),
+                ThoughtEvent::ThoughtEnd => {}
+            }
+        }
+        (thought, message)
+    }
+
+    pub fn flush(&mut self) -> (String, String) {
+        let mut thought = String::new();
+        let mut message = String::new();
+        for event in self.stream.finish() {
+            match event {
+                ThoughtEvent::ThoughtChunk(text) => thought.push_str(&text),
+                ThoughtEvent::ResponseChunk(text) => message.push_str(&text),
+                ThoughtEvent::ThoughtEnd => {}
+            }
+        }
+        (thought, message)
+    }
+
+    pub fn has_emitted_thought(&self) -> bool {
+        self.stream.has_emitted_thought()
+    }
+}
+
 fn find_thought_end(buffer: &str) -> Option<(usize, usize, bool)> {
     for marker in ["</thinking>", "</think>"] {
         if let Some(idx) = buffer.find(marker) {
@@ -173,26 +208,18 @@ fn find_thought_end(buffer: &str) -> Option<(usize, usize, bool)> {
                 .is_some_and(|c| c.is_alphanumeric());
 
         if heading || bold_label {
-            // Pour la compatibilité Markdown on conserve le séparateur dans le
-            // message final, comme le faisait la précédente implémentation.
             return Some((abs_idx, 0, true));
         }
-
         search_from = abs_idx + 2;
     }
     None
 }
 
-/// Émet une notification ACP de pensée avec le même `message_id` que le tour.
-///
-/// Le `message_id` stable permet au client ACP de rattacher les chunks de pensée
-/// et les chunks de réponse au même message assistant, à la manière du
-/// `applyMessageId` de `claude-agent-acp`.
 pub async fn notify_thought(
     cx: &ConnectionTo<Client>,
     session_id: &SessionId,
     message_id: &MessageId,
-    text: String,
+    text: &str,
 ) -> Result<(), AcpError> {
     if text.is_empty() {
         return Ok(());
@@ -201,7 +228,7 @@ pub async fn notify_thought(
     cx.send_notification(SessionNotification::new(
         session_id.clone(),
         SessionUpdate::AgentThoughtChunk(
-            ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
+            ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_owned())))
                 .message_id(message_id.clone()),
         ),
     ))
