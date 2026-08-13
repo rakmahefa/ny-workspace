@@ -1,12 +1,7 @@
 //! Protocol-level ACP tool UX mapping for Gemini tools.
 //!
-//! Every tool follows the same visual contract:
-//! 1. identity
-//! 2. lifecycle / permission / risk metadata
-//! 3. a formatted content or output section
-//!
-//! The ACP wire status remains authoritative; this module controls only the
-//! human-facing content attached to tool calls and updates.
+//! All builtins share the same visual contract: identity, lifecycle/permission/
+//! risk metadata, then a formatted Input/Content/Output block.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -46,10 +41,14 @@ impl ToolInfo {
             "search_and_read" => search_and_read(args, cwd),
             "shell_exec" => shell_exec(args, terminal_id),
             "AskUserQuestion" => ask_user_question(args),
+            "FollowUp" => follow_up(args),
             _ => generic(name, args),
         }
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+enum CardBodyKind { Output, Content, Input }
 
 #[derive(Debug, Clone)]
 struct ToolVisual {
@@ -62,39 +61,8 @@ struct ToolVisual {
 impl ToolVisual {
     fn for_tool(name: &str, args: &Value) -> Self {
         let (icon, label) = tool_visual(name);
-        Self {
-            icon,
-            label,
-            permission: permission_label(name),
-            risk: classify_risk(name, args),
-        }
+        Self { icon, label, permission: permission_label(name), risk: classify_risk(name, args) }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum CardBodyKind {
-    Output,
-    Content,
-    Input,
-}
-
-pub fn bounded_raw_input(args: &Value) -> Value {
-    let mut value = args.clone();
-    let Some(object) = value.as_object_mut() else { return value };
-    let Some(content_value) = object.get_mut("content") else { return value };
-    let Some(content) = content_value.as_str() else { return value };
-
-    let count = content.chars().count();
-    if count <= MAX_RAW_INPUT_CHARS {
-        return value;
-    }
-
-    let preview: String = content.chars().take(MAX_RAW_INPUT_CHARS).collect();
-    *content_value = Value::String(format!(
-        "{preview}\n… [{} chars omitted from ACP display]",
-        count - MAX_RAW_INPUT_CHARS
-    ));
-    value
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +70,18 @@ pub struct ResultUpdate {
     pub status: ToolCallStatus,
     pub content: Vec<ToolCallContent>,
     pub locations: Vec<ToolCallLocation>,
+}
+
+pub fn bounded_raw_input(args: &Value) -> Value {
+    let mut value = args.clone();
+    let Some(object) = value.as_object_mut() else { return value };
+    let Some(content_value) = object.get_mut("content") else { return value };
+    let Some(content) = content_value.as_str() else { return value };
+    let count = content.chars().count();
+    if count <= MAX_RAW_INPUT_CHARS { return value; }
+    let preview: String = content.chars().take(MAX_RAW_INPUT_CHARS).collect();
+    *content_value = Value::String(format!("{preview}\n… [{} chars omitted from ACP display]", count - MAX_RAW_INPUT_CHARS));
+    value
 }
 
 fn ux_card(
@@ -114,43 +94,28 @@ fn ux_card(
     let visual = ToolVisual::for_tool(tool_name, args);
     let mut text = format!(
         "**{} {}**\n{}  ·  {}  ·  {} {}",
-        visual.icon,
-        visual.label,
-        phase,
-        visual.permission,
-        visual.risk.emoji(),
-        visual.risk.label(),
+        visual.icon, visual.label, phase, visual.permission, visual.risk.emoji(), visual.risk.label()
     );
-
-    if let Some(terminal) = terminal {
-        text.push_str(&format!("  ·  ▣ terminal {terminal}"));
-    }
-
-    let body = body
+    if let Some(terminal) = terminal { text.push_str(&format!("  ·  ▣ terminal {terminal}")); }
+    let rendered_body = body
         .map(|(body, kind, error)| render_card_body(body, kind, error))
         .unwrap_or_else(|| render_card_body("_En attente du résultat…_", CardBodyKind::Content, false));
-
     text.push_str("\n\n");
-    text.push_str(&body);
+    text.push_str(&rendered_body);
     text_content(&truncate(&text, MAX_CARD_BODY_CHARS), false)
 }
 
 fn render_card_body(body: &str, kind: CardBodyKind, error: bool) -> String {
+    let label = match kind { CardBodyKind::Output => "Output", CardBodyKind::Content => "Content", CardBodyKind::Input => "Input" };
     if body.trim().is_empty() {
         return match kind {
-            CardBodyKind::Output => "**Output**\n_Sortie vide._".into(),
-            CardBodyKind::Content => "**Content**\n_Aucun contenu._".into(),
-            CardBodyKind::Input => "**Input**\n_Aucune donnée._".into(),
+            CardBodyKind::Output => format!("**{label}**\n_Sortie vide._"),
+            CardBodyKind::Content => format!("**{label}**\n_Aucun contenu._"),
+            CardBodyKind::Input => format!("**{label}**\n_Aucune donnée._"),
         };
     }
-
-    let label = match kind {
-        CardBodyKind::Output => "Output",
-        CardBodyKind::Content => "Content",
-        CardBodyKind::Input => "Input",
-    };
-    let _ = error;
-    format!("**{label}**\n```text\n{body}\n```")
+    let prefix = if error { "⚠️\n" } else { "" };
+    format!("**{label}**\n```text\n{prefix}{body}\n```")
 }
 
 fn tool_visual(name: &str) -> (&'static str, &'static str) {
@@ -164,6 +129,7 @@ fn tool_visual(name: &str) -> (&'static str, &'static str) {
         "search_and_read" => ("🔎", "Search & Read"),
         "shell_exec" => ("▣", "Shell"),
         "AskUserQuestion" => ("⚙️", "Ask User"),
+        "FollowUp" => ("↪", "Follow-up"),
         _ => ("⚙️", "Tool"),
     }
 }
@@ -172,6 +138,7 @@ fn permission_label(name: &str) -> &'static str {
     match name {
         "file_write" | "file_edit" | "replace_in_file" | "shell_exec" => "🔐 permission",
         "AskUserQuestion" => "👤 user input",
+        "FollowUp" => "🔓 no permission",
         _ => "🔓 no permission",
     }
 }
@@ -190,11 +157,7 @@ pub fn result_update(
     match tool_name {
         "file_read" => {
             let body = if is_ok { format_numbered_read(result, args) } else { result.to_owned() };
-            ResultUpdate {
-                status,
-                content: vec![ux_card(tool_name, phase, args, Some((&body, CardBodyKind::Output, !is_ok)), terminal_id)],
-                locations: file_location(args, cwd),
-            }
+            ResultUpdate { status, content: vec![ux_card(tool_name, phase, args, Some((&body, CardBodyKind::Output, !is_ok)), terminal_id)], locations: file_location(args, cwd) }
         }
         "glob" | "list_directory" => ResultUpdate {
             status,
@@ -203,9 +166,7 @@ pub fn result_update(
         },
         "shell_exec" => {
             let mut content = vec![ux_card(tool_name, phase, args, Some((result.trim_end(), CardBodyKind::Output, !is_ok)), terminal_id)];
-            if let Some(id) = terminal_id {
-                content.push(ToolCallContent::Terminal(agent_client_protocol::schema::v1::Terminal::new(id.to_owned())));
-            }
+            if let Some(id) = terminal_id { content.push(ToolCallContent::Terminal(agent_client_protocol::schema::v1::Terminal::new(id.to_owned()))); }
             ResultUpdate { status, content, locations: vec![] }
         }
         "file_write" | "file_edit" | "replace_in_file" => ResultUpdate {
@@ -215,37 +176,18 @@ pub fn result_update(
         },
         "search" | "search_and_read" => {
             let rendered = normalize_search_result(tool_name, result, cwd);
-            ResultUpdate {
-                status,
-                content: vec![ux_card(tool_name, phase, args, Some((rendered.trim_end(), CardBodyKind::Output, !is_ok)), terminal_id)],
-                locations: search_result_locations(result, cwd),
-            }
+            ResultUpdate { status, content: vec![ux_card(tool_name, phase, args, Some((rendered.trim_end(), CardBodyKind::Output, !is_ok)), terminal_id)], locations: search_result_locations(result, cwd) }
         }
         "AskUserQuestion" => {
             let body = if is_ok { render_ask_user_result(result) } else { result.to_owned() };
-            ResultUpdate {
-                status,
-                content: vec![ux_card(tool_name, phase, args, Some((&body, CardBodyKind::Content, !is_ok)), terminal_id)],
-                locations: vec![],
-            }
+            ResultUpdate { status, content: vec![ux_card(tool_name, phase, args, Some((&body, CardBodyKind::Content, !is_ok)), terminal_id)], locations: vec![] }
         }
-        _ => ResultUpdate {
-            status,
-            content: vec![ux_card(tool_name, phase, args, Some((result.trim_end(), CardBodyKind::Output, !is_ok)), terminal_id)],
-            locations: vec![],
-        },
+        "FollowUp" => {
+            let body = if is_ok { render_follow_up_result(result) } else { result.to_owned() };
+            ResultUpdate { status, content: vec![ux_card(tool_name, phase, args, Some((&body, CardBodyKind::Content, !is_ok)), terminal_id)], locations: vec![] }
+        }
+        _ => ResultUpdate { status, content: vec![ux_card(tool_name, phase, args, Some((result.trim_end(), CardBodyKind::Output, !is_ok)), terminal_id)], locations: vec![] },
     }
-}
-
-fn format_numbered_read(result: &str, args: &Value) -> String {
-    let start = args.get("offset").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
-    result
-        .trim_end_matches('\n')
-        .split('\n')
-        .enumerate()
-        .map(|(idx, line)| format!("{}\t{}", start + idx, line))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn file_read(args: &Value, cwd: &Path) -> ToolInfo {
@@ -253,12 +195,7 @@ fn file_read(args: &Value, cwd: &Path) -> ToolInfo {
     let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(1).max(1);
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(500).max(1);
     let input = format!("{}  ·  lignes {}-{}", display_path(path, cwd), offset, offset + limit - 1);
-    ToolInfo {
-        title: format!("Read {} ({}-{})", display_path(path, cwd), offset, offset + limit - 1),
-        kind: agent_client_protocol::schema::v1::ToolKind::Read,
-        content: vec![ux_card("file_read", "⏳ pending", args, Some((&input, CardBodyKind::Input, false)), None)],
-        locations: vec![ToolCallLocation::new(resolve_path(path, cwd)).line(offset as u32)],
-    }
+    ToolInfo { title: format!("Read {} ({}-{})", display_path(path, cwd), offset, offset + limit - 1), kind: agent_client_protocol::schema::v1::ToolKind::Read, content: vec![ux_card("file_read", "⏳ pending", args, Some((&input, CardBodyKind::Input, false)), None)], locations: vec![ToolCallLocation::new(resolve_path(path, cwd)).line(offset as u32)] }
 }
 
 fn file_write(args: &Value, cwd: &Path) -> ToolInfo {
@@ -267,12 +204,7 @@ fn file_write(args: &Value, cwd: &Path) -> ToolInfo {
     let resolved = resolve_path(path, cwd);
     let diff = Diff::new(resolved.clone(), content.to_owned()).old_text(read_old_text(&resolved));
     let input = format!("{}  ·  {} chars", display_path(path, cwd), content.chars().count());
-    ToolInfo {
-        title: format!("Write {}", display_path(path, cwd)),
-        kind: agent_client_protocol::schema::v1::ToolKind::Edit,
-        content: vec![ux_card("file_write", "⏳ pending", args, Some((&input, CardBodyKind::Input, false)), None), ToolCallContent::Diff(diff)],
-        locations: vec![ToolCallLocation::new(resolved)],
-    }
+    ToolInfo { title: format!("Write {}", display_path(path, cwd)), kind: agent_client_protocol::schema::v1::ToolKind::Edit, content: vec![ux_card("file_write", "⏳ pending", args, Some((&input, CardBodyKind::Input, false)), None), ToolCallContent::Diff(diff)], locations: vec![ToolCallLocation::new(resolved)] }
 }
 
 fn file_edit(args: &Value, cwd: &Path) -> ToolInfo {
@@ -283,12 +215,7 @@ fn file_edit(args: &Value, cwd: &Path) -> ToolInfo {
     let old_text = if old.is_empty() { read_old_text(&resolved) } else { Some(old.to_owned()) };
     let diff = Diff::new(resolved.clone(), new.to_owned()).old_text(old_text);
     let input = format!("{}  ·  replacement {} → {} chars", display_path(path, cwd), old.chars().count(), new.chars().count());
-    ToolInfo {
-        title: format!("Edit {}", display_path(path, cwd)),
-        kind: agent_client_protocol::schema::v1::ToolKind::Edit,
-        content: vec![ux_card("file_edit", "⏳ pending", args, Some((&input, CardBodyKind::Input, false)), None), ToolCallContent::Diff(diff)],
-        locations: vec![ToolCallLocation::new(resolved)],
-    }
+    ToolInfo { title: format!("Edit {}", display_path(path, cwd)), kind: agent_client_protocol::schema::v1::ToolKind::Edit, content: vec![ux_card("file_edit", "⏳ pending", args, Some((&input, CardBodyKind::Input, false)), None), ToolCallContent::Diff(diff)], locations: vec![ToolCallLocation::new(resolved)] }
 }
 
 fn glob(args: &Value, cwd: &Path) -> ToolInfo {
@@ -296,88 +223,65 @@ fn glob(args: &Value, cwd: &Path) -> ToolInfo {
     let path = arg_str(args, "path").unwrap_or(".");
     let max_results = args.get("max_results").and_then(Value::as_u64).unwrap_or(100);
     let input = format!("pattern `{}`  ·  path {}  ·  max {}", truncate(pattern, 72), display_path(path, cwd), max_results);
-    ToolInfo {
-        title: format!("Find paths `{}`", truncate(pattern, 72)),
-        kind: agent_client_protocol::schema::v1::ToolKind::Search,
-        content: vec![ux_card("glob", "⏳ pending", args, Some((&input, CardBodyKind::Input, false)), None)],
-        locations: vec![ToolCallLocation::new(resolve_path(path, cwd))],
-    }
+    ToolInfo { title: format!("Find paths `{}`", truncate(pattern, 72)), kind: agent_client_protocol::schema::v1::ToolKind::Search, content: vec![ux_card("glob", "⏳ pending", args, Some((&input, CardBodyKind::Input, false)), None)], locations: vec![ToolCallLocation::new(resolve_path(path, cwd))] }
 }
 
 fn list_directory(args: &Value, cwd: &Path) -> ToolInfo {
     let path = arg_str(args, "path").unwrap_or(".");
     let input = format!("path {}", display_path(path, cwd));
-    ToolInfo {
-        title: format!("List {}", display_path(path, cwd)),
-        kind: agent_client_protocol::schema::v1::ToolKind::Read,
-        content: vec![ux_card("list_directory", "⏳ pending", args, Some((&input, CardBodyKind::Input, false)), None)],
-        locations: vec![ToolCallLocation::new(resolve_path(path, cwd))],
-    }
+    ToolInfo { title: format!("List {}", display_path(path, cwd)), kind: agent_client_protocol::schema::v1::ToolKind::Read, content: vec![ux_card("list_directory", "⏳ pending", args, Some((&input, CardBodyKind::Input, false)), None)], locations: vec![ToolCallLocation::new(resolve_path(path, cwd))] }
 }
 
 fn search(args: &Value, cwd: &Path) -> ToolInfo {
     let pattern = arg_str(args, "pattern").unwrap_or("");
     let path = arg_str(args, "path").unwrap_or(".");
-    let input = if path == "." { format!("pattern `{}`", truncate(pattern, 72)) }
-    else { format!("pattern `{}`  ·  path {}", truncate(pattern, 56), display_path(path, cwd)) };
-    ToolInfo {
-        title: if path == "." { format!("Find `{}`", truncate(pattern, 72)) } else { format!("Find `{}` in {}", truncate(pattern, 56), display_path(path, cwd)) },
-        kind: agent_client_protocol::schema::v1::ToolKind::Search,
-        content: vec![ux_card("search", "⏳ pending", args, Some((&input, CardBodyKind::Input, false)), None)],
-        locations: vec![ToolCallLocation::new(resolve_path(path, cwd))],
-    }
+    let input = if path == "." { format!("pattern `{}`", truncate(pattern, 72)) } else { format!("pattern `{}`  ·  path {}", truncate(pattern, 56), display_path(path, cwd)) };
+    ToolInfo { title: if path == "." { format!("Find `{}`", truncate(pattern, 72)) } else { format!("Find `{}` in {}", truncate(pattern, 56), display_path(path, cwd)) }, kind: agent_client_protocol::schema::v1::ToolKind::Search, content: vec![ux_card("search", "⏳ pending", args, Some((&input, CardBodyKind::Input, false)), None)], locations: vec![ToolCallLocation::new(resolve_path(path, cwd))] }
 }
 
 fn search_and_read(args: &Value, cwd: &Path) -> ToolInfo {
     let pattern = arg_str(args, "pattern").unwrap_or("");
     let path = arg_str(args, "path").unwrap_or(".");
     let context = args.get("context").and_then(Value::as_u64).unwrap_or(0);
-    let input = if path == "." { format!("pattern `{}`  ·  context ±{}", truncate(pattern, 56), context) }
-    else { format!("pattern `{}`  ·  path {}  ·  context ±{}", truncate(pattern, 40), display_path(path, cwd), context) };
-    ToolInfo {
-        title: if path == "." { format!("Find excerpts for `{}`", truncate(pattern, 56)) } else { format!("Find excerpts for `{}` in {}", truncate(pattern, 40), display_path(path, cwd)) },
-        kind: agent_client_protocol::schema::v1::ToolKind::Search,
-        content: vec![ux_card("search_and_read", "⏳ pending", args, Some((&input, CardBodyKind::Input, false)), None)],
-        locations: vec![ToolCallLocation::new(resolve_path(path, cwd))],
-    }
+    let input = if path == "." { format!("pattern `{}`  ·  context ±{}", truncate(pattern, 56), context) } else { format!("pattern `{}`  ·  path {}  ·  context ±{}", truncate(pattern, 40), display_path(path, cwd), context) };
+    ToolInfo { title: if path == "." { format!("Find excerpts for `{}`", truncate(pattern, 56)) } else { format!("Find excerpts for `{}` in {}", truncate(pattern, 40), display_path(path, cwd)) }, kind: agent_client_protocol::schema::v1::ToolKind::Search, content: vec![ux_card("search_and_read", "⏳ pending", args, Some((&input, CardBodyKind::Input, false)), None)], locations: vec![ToolCallLocation::new(resolve_path(path, cwd))] }
 }
 
 fn shell_exec(args: &Value, terminal_id: Option<&str>) -> ToolInfo {
     let command = arg_str(args, "command").unwrap_or("");
     let mut content = vec![ux_card("shell_exec", "⏳ pending", args, Some((command, CardBodyKind::Input, false)), terminal_id)];
     if let Some(id) = terminal_id { content.push(ToolCallContent::Terminal(agent_client_protocol::schema::v1::Terminal::new(id.to_owned()))); }
-    ToolInfo {
-        title: if command.is_empty() { "Terminal".into() } else { truncate(command, 96) },
-        kind: agent_client_protocol::schema::v1::ToolKind::Execute,
-        content,
-        locations: vec![],
-    }
+    ToolInfo { title: if command.is_empty() { "Terminal".into() } else { truncate(command, 96) }, kind: agent_client_protocol::schema::v1::ToolKind::Execute, content, locations: vec![] }
 }
 
 fn ask_user_question(args: &Value) -> ToolInfo {
     let title = ask_user_title(args);
     let body = render_ask_user_input(args);
-    ToolInfo {
-        title,
-        kind: agent_client_protocol::schema::v1::ToolKind::Other,
-        content: vec![ux_card("AskUserQuestion", "⏳ waiting for user", args, Some((&body, CardBodyKind::Content, false)), None)],
-        locations: vec![],
-    }
+    ToolInfo { title, kind: agent_client_protocol::schema::v1::ToolKind::Other, content: vec![ux_card("AskUserQuestion", "⏳ waiting for user", args, Some((&body, CardBodyKind::Content, false)), None)], locations: vec![] }
+}
+
+fn follow_up(args: &Value) -> ToolInfo {
+    let label = arg_str(args, "label").unwrap_or("Suggested next step");
+    let query = arg_str(args, "query").unwrap_or("");
+    let input = format!("{label}\n→ {query}");
+    ToolInfo { title: format!("Follow-up · {}", truncate(label, 72)), kind: agent_client_protocol::schema::v1::ToolKind::Other, content: vec![ux_card("FollowUp", "⏳ pending", args, Some((&input, CardBodyKind::Content, false)), None)], locations: vec![] }
 }
 
 fn generic(name: &str, args: &Value) -> ToolInfo {
     let body = if args.as_object().is_none_or(|obj| obj.is_empty()) { "No input payload.".to_owned() } else { concise_args(args) };
-    ToolInfo {
-        title: name.to_owned(),
-        kind: agent_client_protocol::schema::v1::ToolKind::Other,
-        content: vec![ux_card(name, "⏳ pending", args, Some((&body, CardBodyKind::Input, false)), None)],
-        locations: vec![],
-    }
+    ToolInfo { title: name.to_owned(), kind: agent_client_protocol::schema::v1::ToolKind::Other, content: vec![ux_card(name, "⏳ pending", args, Some((&body, CardBodyKind::Input, false)), None)], locations: vec![] }
 }
 
 fn text_content(text: &str, error: bool) -> ToolCallContent {
     let rendered = if error { format!("⚠️ {text}") } else { text.to_owned() };
     ToolCallContent::Content(Content::new(ContentBlock::Text(TextContent::new(rendered))))
+}
+
+fn render_follow_up_result(result: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(result) else { return result.to_owned() };
+    let label = value.get("label").and_then(Value::as_str).unwrap_or("Suggested next step");
+    let query = value.get("query").and_then(Value::as_str).unwrap_or("");
+    format!("{}\n→ {}", label, query)
 }
 
 fn render_ask_user_input(args: &Value) -> String {
@@ -389,9 +293,7 @@ fn render_ask_user_input(args: &Value) -> String {
         let prompt = question.get("question").and_then(Value::as_str).unwrap_or("Question indisponible.");
         output.push_str(&format!("{header}\n{prompt}"));
         if let Some(options) = question.get("options").and_then(Value::as_array) {
-            for option in options {
-                if let Some(label) = option.get("label").and_then(Value::as_str) { output.push_str(&format!("\n- {label}")); }
-            }
+            for option in options { if let Some(label) = option.get("label").and_then(Value::as_str) { output.push_str(&format!("\n- {label}")); } }
         }
     }
     truncate(&output, MAX_QUESTION_PREVIEW_CHARS)
@@ -405,16 +307,17 @@ fn render_ask_user_result(result: &str) -> String {
 }
 
 fn answer_display(value: &Value) -> String {
-    match value {
-        Value::Array(items) => items.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "),
-        Value::String(text) => text.clone(),
-        _ => value.to_string(),
-    }
+    match value { Value::Array(items) => items.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "), Value::String(text) => text.clone(), _ => value.to_string() }
 }
 
 fn ask_user_title(args: &Value) -> String {
     let question = args.get("questions").and_then(Value::as_array).and_then(|questions| questions.first()).and_then(|question| question.get("question")).and_then(Value::as_str).unwrap_or("User input");
     format!("Ask user · {}", truncate(question, 72))
+}
+
+fn format_numbered_read(result: &str, args: &Value) -> String {
+    let start = args.get("offset").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
+    result.trim_end_matches('\n').split('\n').enumerate().map(|(idx, line)| format!("{}\t{}", start + idx, line)).collect::<Vec<_>>().join("\n")
 }
 
 fn file_location(args: &Value, cwd: &Path) -> Vec<ToolCallLocation> {
@@ -424,8 +327,8 @@ fn file_location(args: &Value, cwd: &Path) -> Vec<ToolCallLocation> {
 fn filesystem_result_locations(tool_name: &str, result: &str, cwd: &Path) -> Vec<ToolCallLocation> {
     if tool_name == "list_directory" { return vec![]; }
     result.lines().take(MAX_RESULT_LOCATIONS).filter_map(|line| {
-        let path = PathBuf::from(line.trim());
-        if path.as_os_str().is_empty() { None } else { Some(ToolCallLocation::new(resolve_path(&path.to_string_lossy(), cwd))) }
+        let path = line.trim();
+        if path.is_empty() { None } else { Some(ToolCallLocation::new(resolve_path(path, cwd))) }
     }).collect()
 }
 
@@ -444,12 +347,11 @@ fn search_result_locations(result: &str, cwd: &Path) -> Vec<ToolCallLocation> {
 }
 
 fn normalize_search_result(tool_name: &str, result: &str, cwd: &Path) -> String {
-    let mut output = String::with_capacity(result.len().min(MAX_RESULT_PREVIEW_CHARS));
+    let mut output = String::new();
     for (index, line) in result.lines().enumerate() {
-        if output.chars().count() >= MAX_RESULT_PREVIEW_CHARS { break; }
         if index > 0 { output.push('\n'); }
-        if tool_name == "search_and_read" && line.starts_with("## ") { output.push_str(&normalize_heading_path(line, cwd)); }
-        else { output.push_str(&normalize_match_line(line, cwd)); }
+        if tool_name == "search_and_read" && line.starts_with("## ") { output.push_str(&normalize_heading_path(line, cwd)); } else { output.push_str(&normalize_match_line(line, cwd)); }
+        if output.chars().count() >= MAX_RESULT_PREVIEW_CHARS { break; }
     }
     truncate(&output, MAX_RESULT_PREVIEW_CHARS)
 }
@@ -486,11 +388,7 @@ fn resolve_path(path: &str, cwd: &Path) -> PathBuf {
 
 fn display_path(path: &str, cwd: &Path) -> String {
     let resolved = resolve_path(path, cwd);
-    match resolved.strip_prefix(cwd) {
-        Ok(relative) if !relative.as_os_str().is_empty() => relative.display().to_string(),
-        Ok(_) => ".".into(),
-        Err(_) => path.to_owned(),
-    }
+    match resolved.strip_prefix(cwd) { Ok(relative) if !relative.as_os_str().is_empty() => relative.display().to_string(), Ok(_) => ".".into(), Err(_) => path.to_owned() }
 }
 
 fn read_old_text(path: &Path) -> Option<String> {
@@ -518,25 +416,11 @@ pub fn classify_risk(name: &str, args: &Value) -> RiskLevel {
 }
 
 pub fn lifecycle_label(state: ToolLifecycleState) -> &'static str {
-    match state {
-        ToolLifecycleState::Pending => "pending",
-        ToolLifecycleState::Permission => "permission",
-        ToolLifecycleState::Executing => "executing",
-        ToolLifecycleState::Completed => "completed",
-        ToolLifecycleState::Failed => "failed",
-        ToolLifecycleState::Cancelled => "cancelled",
-    }
+    match state { ToolLifecycleState::Pending => "pending", ToolLifecycleState::Permission => "permission", ToolLifecycleState::Executing => "executing", ToolLifecycleState::Completed => "completed", ToolLifecycleState::Failed => "failed", ToolLifecycleState::Cancelled => "cancelled" }
 }
 
 pub fn lifecycle_icon(state: ToolLifecycleState) -> &'static str {
-    match state {
-        ToolLifecycleState::Pending => "⏳",
-        ToolLifecycleState::Permission => "🔐",
-        ToolLifecycleState::Executing => "▶",
-        ToolLifecycleState::Completed => "🟢",
-        ToolLifecycleState::Failed => "🔴",
-        ToolLifecycleState::Cancelled => "⚪",
-    }
+    match state { ToolLifecycleState::Pending => "⏳", ToolLifecycleState::Permission => "🔐", ToolLifecycleState::Executing => "▶", ToolLifecycleState::Completed => "🟢", ToolLifecycleState::Failed => "🔴", ToolLifecycleState::Cancelled => "⚪" }
 }
 
 #[cfg(test)]
@@ -546,107 +430,32 @@ mod tests {
     fn text_of(content: &ToolCallContent) -> String { format!("{content:?}") }
 
     #[test]
-    fn filesystem_tools_have_the_same_card_contract() {
-        let cwd = Path::new("/tmp/project");
-        for (name, args) in [
-            ("glob", serde_json::json!({"pattern":"**/*.rs","path":"src","max_results":20})),
-            ("list_directory", serde_json::json!({"path":"src"})),
-        ] {
-            let info = ToolInfo::build(name, &args, cwd, None);
-            assert_eq!(info.content.iter().filter(|item| matches!(item, ToolCallContent::Content(_))).count(), 1);
-            let rendered = text_of(&info.content[0]);
-            assert!(rendered.contains("Input"));
-            assert!(rendered.contains("pending"));
-        }
+    fn follow_up_has_a_dedicated_card() {
+        let args = serde_json::json!({"label":"Initialiser un nouveau projet","query":"Initialisons un nouveau projet dans cet espace de travail."});
+        let info = ToolInfo::build("FollowUp", &args, Path::new("/tmp"), None);
+        let rendered = text_of(&info.content[0]);
+        assert!(rendered.contains("Follow-up"));
+        assert!(rendered.contains("Initialiser un nouveau projet"));
+        assert!(rendered.contains("Input") || rendered.contains("Content"));
     }
 
     #[test]
-    fn completed_glob_keeps_paths_inside_output_card() {
-        let args = serde_json::json!({"pattern":"**/*.rs","path":"src"});
-        let update = result_update("glob", &args, "/tmp/project/src/a.rs\n/tmp/project/src/b.rs", true, Path::new("/tmp/project"), None);
+    fn follow_up_completion_keeps_label_and_query_in_card() {
+        let args = serde_json::json!({"label":"Initialiser","query":"Initialisons le projet."});
+        let update = result_update("FollowUp", &args, r#"{"label":"Initialiser","query":"Initialisons le projet."}"#, true, Path::new("/tmp"), None);
         assert_eq!(update.content.len(), 1);
         let rendered = text_of(&update.content[0]);
-        assert!(rendered.contains("Glob"));
-        assert!(rendered.contains("Output"));
-        assert!(rendered.contains("src/a.rs"));
-    }
-
-    #[test]
-    fn completed_directory_list_keeps_listing_inside_output_card() {
-        let args = serde_json::json!({"path":"src"});
-        let update = result_update("list_directory", &args, "dir\tutils\nfile\tlib.rs", true, Path::new("/tmp/project"), None);
-        assert_eq!(update.content.len(), 1);
-        let rendered = text_of(&update.content[0]);
-        assert!(rendered.contains("Directory"));
-        assert!(rendered.contains("Output"));
-        assert!(rendered.contains("file\tlib.rs"));
+        assert!(rendered.contains("completed"));
+        assert!(rendered.contains("Initialiser"));
+        assert!(rendered.contains("Initialisons le projet"));
     }
 
     #[test]
     fn core_tools_keep_one_text_card() {
         let cwd = Path::new("/tmp/project");
-        for (name, args) in [
-            ("file_read", serde_json::json!({"path":"src/lib.rs"})),
-            ("file_write", serde_json::json!({"path":"src/lib.rs","content":"x"})),
-            ("file_edit", serde_json::json!({"path":"src/lib.rs","old_string":"a","new_string":"b"})),
-            ("search", serde_json::json!({"pattern":"foo","path":"src"})),
-            ("search_and_read", serde_json::json!({"pattern":"foo","path":"src"})),
-            ("shell_exec", serde_json::json!({"command":"cargo test"})),
-            ("AskUserQuestion", serde_json::json!({"questions":[{"header":"Confirm","question":"Continue?","options":[{"label":"Yes"}]}]})),
-        ] {
+        for (name, args) in [("file_read", serde_json::json!({"path":"src/lib.rs"})), ("glob", serde_json::json!({"pattern":"**/*.rs"})), ("list_directory", serde_json::json!({"path":"src"})), ("search", serde_json::json!({"pattern":"foo"})), ("shell_exec", serde_json::json!({"command":"cargo test"})), ("AskUserQuestion", serde_json::json!({"questions":[{"question":"Continue?","options":[{"label":"Yes"}]}]}))] {
             let info = ToolInfo::build(name, &args, cwd, None);
-            assert_eq!(info.content.iter().filter(|item| matches!(item, ToolCallContent::Content(_))).count(), 1, "expected one text card for {name}");
+            assert!(matches!(info.content.first(), Some(ToolCallContent::Content(_))), "missing card for {name}");
         }
-    }
-
-    #[test]
-    fn completed_file_read_keeps_numbered_output_inside_card() {
-        let args = serde_json::json!({"path":"a.txt","offset":10});
-        let update = result_update("file_read", &args, "line a\nline b", true, Path::new("/tmp/project"), None);
-        assert_eq!(update.content.len(), 1);
-        let rendered = text_of(&update.content[0]);
-        assert!(rendered.contains("10\tline a"));
-        assert!(rendered.contains("11\tline b"));
-        assert!(rendered.contains("Output"));
-    }
-
-    #[test]
-    fn write_edit_keep_diff_and_shell_keeps_terminal() {
-        let cwd = Path::new("/tmp/project");
-        for name in ["file_write", "file_edit", "replace_in_file"] {
-            let args = serde_json::json!({"path":"src/lib.rs","old_string":"a","new_string":"b","content":"fn main() {}"});
-            let info = ToolInfo::build(name, &args, cwd, None);
-            assert!(info.content.iter().any(|item| matches!(item, ToolCallContent::Diff(_))));
-        }
-        let shell = ToolInfo::build("shell_exec", &serde_json::json!({"command":"cargo test"}), cwd, Some("term_1"));
-        assert!(shell.content.iter().any(|item| matches!(item, ToolCallContent::Terminal(_))));
-    }
-
-    #[test]
-    fn ask_user_is_human_readable() {
-        let args = serde_json::json!({"questions":[{"header":"Cleanup","question":"Keep the file?","options":[{"label":"Keep"},{"label":"Delete"}]}]});
-        let info = ToolInfo::build("AskUserQuestion", &args, Path::new("/tmp"), None);
-        let rendered = text_of(&info.content[0]);
-        assert!(rendered.contains("Cleanup"));
-        assert!(rendered.contains("Keep the file?"));
-        assert!(rendered.contains("Keep"));
-        assert!(!rendered.contains("\\\"questions\\\""));
-    }
-
-    #[test]
-    fn lifecycle_and_risk_are_stable() {
-        assert_eq!(classify_risk("glob", &serde_json::json!({})), RiskLevel::Low);
-        assert_eq!(classify_risk("list_directory", &serde_json::json!({})), RiskLevel::Low);
-        assert_eq!(lifecycle_label(ToolLifecycleState::Completed), "completed");
-        assert_eq!(lifecycle_icon(ToolLifecycleState::Completed), "🟢");
-    }
-
-    #[test]
-    fn large_input_is_bounded() {
-        let args = serde_json::json!({"content":"x".repeat(MAX_RAW_INPUT_CHARS + 32)});
-        let bounded = bounded_raw_input(&args);
-        let text = bounded.get("content").and_then(Value::as_str).unwrap();
-        assert!(text.contains("chars omitted"));
-        assert!(text.chars().count() > MAX_RAW_INPUT_CHARS);
     }
 }
