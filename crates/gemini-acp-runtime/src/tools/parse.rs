@@ -152,10 +152,8 @@ fn parse_follow_up_tag(tag: &str) -> Option<(String, String)> {
     let inner = tag
         .strip_prefix("<FollowUp")?
         .strip_suffix('>')?
-        .trim()
-        .strip_suffix('/')
-        .unwrap_or_default()
         .trim();
+    let inner = inner.strip_suffix('/').unwrap_or(inner).trim();
 
     let attrs = parse_attributes(inner);
     let label = attrs.get("label")?.trim();
