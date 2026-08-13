@@ -87,6 +87,7 @@ impl ToolRegistry {
         reg.register(Box::new(crate::tools::builtin::search::SearchTool));
         reg.register(Box::new(crate::tools::builtin::composed::SearchAndReadTool));
         reg.register(Box::new(crate::tools::builtin::composed::ReplaceInFileTool));
+        reg.register(Box::new(crate::tools::interactive::AskUserQuestionTool));
         reg
     }
 
@@ -100,6 +101,7 @@ impl ToolRegistry {
         reg.register(Box::new(crate::tools::builtin::search::SearchTool));
         reg.register(Box::new(crate::tools::builtin::composed::SearchAndReadTool));
         reg.register(Box::new(crate::tools::builtin::composed::ReplaceInFileTool));
+        reg.register(Box::new(crate::tools::interactive::AskUserQuestionTool));
         reg
     }
 
@@ -137,7 +139,7 @@ mod tests {
         let reg = ToolRegistry::builtin();
         let defs = reg.definitions();
         let names: Vec<&str> = defs.iter().filter_map(|d| d.get("name").and_then(Value::as_str)).collect();
-        for expected in ["file_read", "file_write", "file_edit", "shell_exec", "search", "search_and_read", "replace_in_file"] { assert!(names.contains(&expected), "missing {expected}"); }
+        for expected in ["file_read", "file_write", "file_edit", "shell_exec", "search", "search_and_read", "replace_in_file", "AskUserQuestion"] { assert!(names.contains(&expected), "missing {expected}"); }
     }
 
     #[tokio::test]
