@@ -7,9 +7,10 @@
 //! like a completed tool execution.
 
 use agent_client_protocol::schema::v1::{
-    PermissionOption, PermissionOptionKind, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionId, SessionNotification, SessionUpdate,
-    ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    Content, ContentBlock, PermissionOption, PermissionOptionKind,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionId,
+    TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallStatus,
+    ToolCallUpdate, ToolKind,
 };
 use agent_client_protocol::{Client, ConnectionTo};
 use serde_json::json;
@@ -29,8 +30,13 @@ pub async fn request_action(
     query: &str,
 ) -> Result<Option<String>, String> {
     let call_id = ToolCallId::from(format!("followup_{}", uuid::Uuid::new_v4().simple()));
+    let body = format!("**{}**\n\n{}\n\nChoisissez cette action pour envoyer la proposition au modèle.", label, query);
+    let content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(TextContent::new(body))))];
+
     let tool_call = ToolCall::new(call_id.clone(), format!("Follow-up · {}", truncate(label, 80)))
+        .kind(ToolKind::Other)
         .status(ToolCallStatus::Pending)
+        .content(content)
         .raw_input(json!({
             "label": label,
             "query": query,
