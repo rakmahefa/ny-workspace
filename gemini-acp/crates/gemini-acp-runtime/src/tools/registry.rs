@@ -78,30 +78,29 @@ impl ToolRegistry {
         self.tools.push(tool);
     }
 
+    fn register_builtins(&mut self) {
+        self.register(Box::new(crate::tools::builtin::file::FileReadTool));
+        self.register(Box::new(crate::tools::builtin::file::FileWriteTool));
+        self.register(Box::new(crate::tools::builtin::file::FileEditTool));
+        self.register(Box::new(crate::tools::builtin::filesystem::GlobTool));
+        self.register(Box::new(crate::tools::builtin::filesystem::ListDirectoryTool));
+        self.register(Box::new(crate::tools::builtin::shell::ShellExecTool));
+        self.register(Box::new(crate::tools::builtin::search::SearchTool));
+        self.register(Box::new(crate::tools::builtin::composed::SearchAndReadTool));
+        self.register(Box::new(crate::tools::builtin::composed::ReplaceInFileTool));
+        self.register(Box::new(crate::tools::interactive::AskUserQuestionTool));
+    }
+
     pub fn builtin() -> Self {
         let mut reg = Self::new();
-        reg.register(Box::new(crate::tools::builtin::file::FileReadTool));
-        reg.register(Box::new(crate::tools::builtin::file::FileWriteTool));
-        reg.register(Box::new(crate::tools::builtin::file::FileEditTool));
-        reg.register(Box::new(crate::tools::builtin::shell::ShellExecTool));
-        reg.register(Box::new(crate::tools::builtin::search::SearchTool));
-        reg.register(Box::new(crate::tools::builtin::composed::SearchAndReadTool));
-        reg.register(Box::new(crate::tools::builtin::composed::ReplaceInFileTool));
-        reg.register(Box::new(crate::tools::interactive::AskUserQuestionTool));
+        reg.register_builtins();
         reg
     }
 
     #[allow(dead_code)]
     pub fn builtin_with_sandbox(sandbox: SandboxConfig) -> Self {
         let mut reg = Self::with_sandbox(sandbox);
-        reg.register(Box::new(crate::tools::builtin::file::FileReadTool));
-        reg.register(Box::new(crate::tools::builtin::file::FileWriteTool));
-        reg.register(Box::new(crate::tools::builtin::file::FileEditTool));
-        reg.register(Box::new(crate::tools::builtin::shell::ShellExecTool));
-        reg.register(Box::new(crate::tools::builtin::search::SearchTool));
-        reg.register(Box::new(crate::tools::builtin::composed::SearchAndReadTool));
-        reg.register(Box::new(crate::tools::builtin::composed::ReplaceInFileTool));
-        reg.register(Box::new(crate::tools::interactive::AskUserQuestionTool));
+        reg.register_builtins();
         reg
     }
 
@@ -135,11 +134,16 @@ mod tests {
     }
 
     #[test]
-    fn registry_builtin_has_all_phases() {
+    fn registry_builtin_has_all_tools() {
         let reg = ToolRegistry::builtin();
         let defs = reg.definitions();
         let names: Vec<&str> = defs.iter().filter_map(|d| d.get("name").and_then(Value::as_str)).collect();
-        for expected in ["file_read", "file_write", "file_edit", "shell_exec", "search", "search_and_read", "replace_in_file", "AskUserQuestion"] { assert!(names.contains(&expected), "missing {expected}"); }
+        for expected in [
+            "file_read", "file_write", "file_edit", "glob", "list_directory",
+            "shell_exec", "search", "search_and_read", "replace_in_file", "AskUserQuestion"
+        ] {
+            assert!(names.contains(&expected), "missing {expected}");
+        }
     }
 
     #[tokio::test]
