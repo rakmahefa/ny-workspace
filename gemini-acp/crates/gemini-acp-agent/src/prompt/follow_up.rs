@@ -48,7 +48,7 @@ pub async fn request_action(
                 "label": label,
                 "query": query,
             }
-        }));
+        }).as_object().cloned().unwrap());
 
     let options = vec![
         PermissionOption::new(SELECT_ID, label, PermissionOptionKind::AllowOnce),
@@ -68,7 +68,7 @@ pub async fn request_action(
             "query": query,
             "singleUse": true,
         }
-    }));
+    }).as_object().cloned().unwrap());
 
     let response = cx
         .send_request(request)
@@ -77,10 +77,10 @@ pub async fn request_action(
         .map_err(|error| format!("ACP FollowUp action failed: {error}"))?;
 
     match response.outcome {
-        RequestPermissionOutcome::Selected(selected) if selected.option_id.0 == SELECT_ID => {
+        RequestPermissionOutcome::Selected(selected) if selected.option_id.0 == SELECT_ID.into() => {
             Ok(Some(query.to_owned()))
         }
-        RequestPermissionOutcome::Selected(selected) if selected.option_id.0 == SKIP_ID => Ok(None),
+        RequestPermissionOutcome::Selected(selected) if selected.option_id.0 == SKIP_ID.into() => Ok(None),
         RequestPermissionOutcome::Cancelled => Ok(None),
         other => Err(format!("unexpected FollowUp permission outcome: {other:?}")),
     }

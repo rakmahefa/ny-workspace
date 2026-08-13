@@ -182,7 +182,7 @@ pub async fn run_turn(
                         agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(
                             TextContent::new(format!("Upload image {}/{} échoué: {e:#}", idx + 1, total)),
                         )),
-                    ];
+                                                        )];
                     safe_session_update(
                         &cx,
                         &session_id,
