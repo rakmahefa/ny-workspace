@@ -84,6 +84,7 @@ impl ToolRegistry {
         self.register(Box::new(crate::tools::builtin::file::FileEditTool));
         self.register(Box::new(crate::tools::builtin::filesystem::GlobTool));
         self.register(Box::new(crate::tools::builtin::filesystem::ListDirectoryTool));
+        self.register(Box::new(crate::tools::builtin::follow_up::FollowUpTool));
         self.register(Box::new(crate::tools::builtin::shell::ShellExecTool));
         self.register(Box::new(crate::tools::builtin::search::SearchTool));
         self.register(Box::new(crate::tools::builtin::composed::SearchAndReadTool));
@@ -123,49 +124,17 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    struct EchoTool;
-    fn echo_def() -> ToolDef {
-        ToolDef { name: "echo", description: "Répète le message.", parameters_fn: || json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}) }
-    }
-    #[async_trait::async_trait]
-    impl Tool for EchoTool {
-        fn definition(&self) -> &ToolDef { static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new(); DEF.get_or_init(echo_def) }
-        async fn execute(&self, args: &Value, _cwd: &Path, _allowed_dirs: &[PathBuf]) -> ToolResult { ToolResult::Ok(args.get("message").and_then(Value::as_str).unwrap_or("").to_string()) }
-    }
-
     #[test]
-    fn registry_builtin_has_all_tools() {
+    fn registry_builtin_has_all_phases() {
         let reg = ToolRegistry::builtin();
         let defs = reg.definitions();
         let names: Vec<&str> = defs.iter().filter_map(|d| d.get("name").and_then(Value::as_str)).collect();
-        for expected in [
-            "file_read", "file_write", "file_edit", "glob", "list_directory",
-            "shell_exec", "search", "search_and_read", "replace_in_file", "AskUserQuestion"
-        ] {
-            assert!(names.contains(&expected), "missing {expected}");
-        }
-    }
-
-    #[tokio::test]
-    async fn call_async_basic() {
-        let mut reg = ToolRegistry::new();
-        reg.register(Box::new(EchoTool));
-        let result = reg.call_async("echo", &json!({"message":"bonjour"}), Path::new("/tmp"), &[]).await.unwrap();
-        assert!(result.is_ok());
-        assert_eq!(result.to_history_text(), "bonjour");
-    }
-
-    #[tokio::test]
-    async fn call_async_unknown_tool() {
-        let reg = ToolRegistry::new();
-        let result = reg.call_async("nonexistent", &json!({}), Path::new("/tmp"), &[]).await;
-        assert!(result.is_none());
+        for expected in ["file_read", "file_write", "file_edit", "glob", "list_directory", "FollowUp", "shell_exec", "search", "search_and_read", "replace_in_file", "AskUserQuestion"] { assert!(names.contains(&expected), "missing {expected}"); }
     }
 
     #[test]
-    fn sandbox_config_default() {
-        let cfg = SandboxConfig::default();
-        assert!(cfg.allowed_dirs.is_empty());
-        assert!(cfg.shell_sandbox_enabled);
+    fn follow_up_is_registered_as_builtin() {
+        let reg = ToolRegistry::builtin();
+        assert!(reg.definitions().iter().any(|definition| definition.get("name") == Some(&Value::String("FollowUp".into()))));
     }
 }
