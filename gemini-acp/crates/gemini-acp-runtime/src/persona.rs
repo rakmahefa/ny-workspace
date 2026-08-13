@@ -1,7 +1,4 @@
 //! Persona Gemini — définition de la personnalité de l'agent.
-//!
-//! Ce module centralise la construction du prompt système pour l'agent
-//! Gemini ACP. Il définit la persona et les directives de sortie partagées.
 
 use crate::state::Session;
 
@@ -46,19 +43,9 @@ impl Persona {
 
     fn core_instruction(&self) -> &'static str {
         match self {
-            Persona::Coding => "\
-Réponds en Markdown. Propose du code exécutable quand c'est pertinent. \
-Préfère les solutions directes et pragmatiques. \
-Si tu utilises un outil, explique brièvement ce que tu fais avant et après.",
-            Persona::Creative => "\
-Réponds en Markdown avec des explications détaillées. \
-Utilise des analogies et des exemples pour clarifier les concepts. \
-Propose plusieurs approches quand c'est pertinent. \
-Si tu utilises un outil, explique ta démarche en détail.",
-            Persona::Concise => "\
-Réponds avec le minimum de texte. Pas d'explications sauf si demandé. \
-Code directement, sans préambule. \
-N'utilise les outils que si c'est strictement nécessaire.",
+            Persona::Coding => "Réponds en Markdown. Propose du code exécutable quand c'est pertinent. Préfère les solutions directes et pragmatiques. Si tu utilises un outil, explique brièvement ce que tu fais avant et après.",
+            Persona::Creative => "Réponds en Markdown avec des explications détaillées. Utilise des analogies et des exemples pour clarifier les concepts. Propose plusieurs approches quand c'est pertinent. Si tu utilises un outil, explique ta démarche en détail.",
+            Persona::Concise => "Réponds avec le minimum de texte. Pas d'explications sauf si demandé. Code directement, sans préambule. N'utilise les outils que si c'est strictement nécessaire.",
         }
     }
 
@@ -72,7 +59,7 @@ N'utilise les outils que si c'est strictement nécessaire.",
 
 pub fn system_prompt(session: &Session, persona: Option<Persona>) -> String {
     let p = persona.unwrap_or_default();
-    let mut system = String::with_capacity(1600);
+    let mut system = String::with_capacity(1800);
     system.push_str(&format!("[System instruction]: tu es un assistant {} intégré à Zed.\n", p.display_name().to_ascii_lowercase()));
     system.push_str(&format!("CWD: {}\n", session.cwd.display()));
     if !session.additional_directories.is_empty() {
@@ -84,11 +71,11 @@ pub fn system_prompt(session: &Session, persona: Option<Persona>) -> String {
     for constraint in p.constraints() { system.push_str("- "); system.push_str(constraint); system.push('\n'); }
     system.push_str("\
 - Le code doit être complet et exécutable.\n\
-- Utilise les outils (file_read, file_write, shell_exec, search) pour explorer le projet.\n\
+- Utilise les outils (file_read, file_write, shell_exec, search, glob, list_directory) pour explorer le projet.\n\
 - Quand tu modifies un fichier, affiche le chemin et les lignes changées.\n\
-- Pour proposer une seule prochaine action claire à l'utilisateur, utilise exactement un composant `<FollowUp label=\"…\" query=\"…\" />` en fin de réponse.\n\
-- Le `label` est court et orienté action (ex. `Run tests`). Le `query` contient l'action que l'utilisateur déclencherait.\n\
-- N'utilise jamais plus d'un `<FollowUp>` par réponse et n'en génère pas si aucune prochaine action nette ne se dégage.");
+- Pour proposer une seule prochaine action claire à l'utilisateur, appelle le builtin `FollowUp` avec deux arguments : `label` (court, orienté action) et `query` (le texte exact que l'utilisateur déclencherait).\n\
+- N'utilise jamais plus d'un `FollowUp` par réponse et n'en génère pas si aucune prochaine action nette ne se dégage.\n\
+- Le `FollowUp` est une suggestion uniquement : ne l'utilise jamais pour exécuter lui-même l'action proposée.");
     system.push_str("\n\n");
     system
 }
