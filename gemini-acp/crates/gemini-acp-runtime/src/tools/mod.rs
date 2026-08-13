@@ -5,6 +5,7 @@
 //! - [`lifecycle`] : machine d'état déterministe interne, projetée sur les statuts ACP v1.
 //! - [`request`]   : modèle normalisé `ToolCallRequest`, son type et sa machine d'état.
 //! - [`tool_ux`]   : mapping UX ACP inspiré de `claude-agent-acp/src/tools.ts`.
+//! - [`elicitation`] : projection structurée des questions utilisateur vers ACP.
 //! - [`registry`]  : trait `Tool`, `ToolDef`, `ToolRegistry`, `ToolResult`.
 //! - [`parse`]     : extraction des blocs `tool_call` depuis la réponse Gemini.
 //! - [`prompt`]    : injection `# Tool Use` dans le prompt + formatage historique.
@@ -13,6 +14,7 @@
 //! - [`interactive`] : outils qui utilisent directement les capacités interactives ACP.
 
 pub mod builtin;
+pub mod elicitation;
 pub mod executor;
 pub mod interactive;
 pub mod lifecycle;
