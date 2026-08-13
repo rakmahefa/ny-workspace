@@ -12,4 +12,4 @@ pub mod tools;
 
 pub use runtime::{AgentRuntime, AppState};
 pub use session::SessionManager;
-pub use tools::ToolRegistry;
+pub use tools::{ToolCallKind, ToolCallRequest, ToolCallRequestError, ToolCallState, ToolRegistry};
