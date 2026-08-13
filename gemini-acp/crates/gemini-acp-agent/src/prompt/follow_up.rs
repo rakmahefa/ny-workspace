@@ -1,70 +1,96 @@
-//! FollowUp handling for Gemini streams and ACP UI actions.
+//! FollowUp handling for Gemini streams and ACP interactive elicitation.
 //!
-//! FollowUp is not an executable tool. It is an agent-authored next-step
-//! action that the ACP client should render as a clickable interaction.
+//! FollowUp is an agent-authored next-step action. ACP v1 does not expose a
+//! generic inline button component, so the action is presented through the
+//! standard client-side elicitation primitive, which existing ACP hosts know
+//! how to render and resolve interactively.
 
-use serde_json::{json, Map, Value};
 use agent_client_protocol::schema::v1::{
-    Content, ContentBlock, SessionId, SessionNotification, SessionUpdate, TextContent,
-    ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolKind,
+    CreateElicitationRequest, ElicitationAction, ElicitationContentValue,
+    ElicitationFormMode, ElicitationPropertySchema, ElicitationSchema,
+    ElicitationSessionScope, SessionId,
 };
 use agent_client_protocol::{Client, ConnectionTo};
+use serde_json::{json, Value};
 
 const FOLLOW_UP_MARKER: &str = "<FollowUp";
+const SKIP_VALUE: &str = "__followup_skip__";
+const SELECT_VALUE: &str = "__followup_select__";
 
-/// ACP extension metadata consumed by FollowUp-aware clients.
+/// Wait for the user to select or dismiss a FollowUp suggestion.
 ///
-/// ACP v1 does not define a dedicated action component in `SessionUpdate`,
-/// so FollowUp uses the standard `tool_call` envelope with `pending` status
-/// plus `_meta.geminiAcp.ui.action` describing a non-executing prompt action.
-pub fn action_meta(label: &str, query: &str) -> Map<String, Value> {
-    let mut meta = Map::new();
-    meta.insert(
-        "geminiAcp".into(),
-        json!({
-            "nonExecutionKind": "action",
-            "ui": {
-                "component": "action",
-                "action": "follow_up",
-                "kind": "prompt",
-                "label": label,
-                "query": query,
-                "singleUse": true,
-                "dispatch": {
-                    "method": "session/prompt",
-                    "prompt": query
-                }
-            }
-        }),
-    );
-    meta
-}
-
-/// Emit a real interactive FollowUp action through the ACP session update
-/// channel. No permission is requested and no registry tool is executed.
-pub fn emit_action(
+/// Returns `Some(query)` when the user explicitly selects the action and
+/// `None` when the suggestion is dismissed/cancelled. The selected query can
+/// then be fed back into the current model turn without inventing a fake
+/// ToolCall execution.
+pub async fn request_action(
     cx: &ConnectionTo<Client>,
     session_id: &SessionId,
     label: &str,
     query: &str,
-) -> ToolCallId {
-    let call_id = ToolCallId::from(format!("followup_{}", uuid::Uuid::new_v4().simple()));
-    let title = format!("Follow-up · {}", truncate(label, 80));
-    let body = format!("**{}**\n\n{}\n\n_Select cette action pour envoyer cette proposition au modèle._", label, query);
-    let meta = action_meta(label, query);
-    let content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(TextContent::new(body))))];
-    let tool = ToolCall::new(call_id.clone(), title)
-        .kind(ToolKind::Other)
-        .status(ToolCallStatus::Pending)
-        .content(content)
-        .raw_input(json!({ "label": label, "query": query }))
-        .meta(meta);
+) -> Result<Option<String>, String> {
+    let mut schema = ElicitationSchema::new();
 
-    let _ = cx.send_notification(SessionNotification::new(
-        session_id.clone(),
-        SessionUpdate::ToolCall(tool),
-    ));
-    call_id
+    let action_schema: ElicitationPropertySchema = serde_json::from_value(json!({
+        "type": "string",
+        "title": "Action",
+        "description": query,
+        "oneOf": [
+            {
+                "const": SELECT_VALUE,
+                "title": label,
+                "description": query
+            },
+            {
+                "const": SKIP_VALUE,
+                "title": "Ignorer",
+                "description": "Ne pas exécuter cette proposition."
+            }
+        ],
+        "_meta": {
+            "geminiAcp": {
+                "component": "follow_up_action",
+                "label": label,
+                "query": query,
+                "submitBehavior": "prompt"
+            }
+        }
+    }))
+    .map_err(|error| format!("invalid FollowUp elicitation schema: {error}"))?;
+
+    schema = schema.property("action", action_schema, true);
+
+    let mode = ElicitationFormMode::new(ElicitationSessionScope::new(session_id.clone()), schema);
+    let request = CreateElicitationRequest::new(
+        mode,
+        format!("{label}\n\n{query}"),
+    );
+
+    let response = cx
+        .send_request(request)
+        .block_task()
+        .await
+        .map_err(|error| format!("ACP FollowUp elicitation failed: {error}"))?;
+
+    match response.action {
+        ElicitationAction::Accept(accept) => {
+            let selected = accept
+                .content
+                .and_then(|content| content.get("action").cloned())
+                .and_then(|value| match value {
+                    ElicitationContentValue::String(value) => Some(value),
+                    _ => None,
+                });
+
+            match selected.as_deref() {
+                Some(SELECT_VALUE) => Ok(Some(query.to_owned())),
+                Some(SKIP_VALUE) | None => Ok(None),
+                Some(_) => Err("ACP returned an unknown FollowUp action value".into()),
+            }
+        }
+        ElicitationAction::Decline | ElicitationAction::Cancel => Ok(None),
+        _ => Err("ACP returned an unsupported FollowUp elicitation action".into()),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -146,25 +172,14 @@ fn find_tag_end(input: &str) -> Option<usize> {
     None
 }
 
-fn truncate(value: &str, max: usize) -> String {
-    if value.chars().count() <= max { return value.to_owned(); }
-    format!("{}…", value.chars().take(max).collect::<String>())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn action_meta_is_non_executing_and_clickable() {
-        let meta = action_meta("Run tests", "cargo test");
-        assert_eq!(meta["geminiAcp"]["nonExecutionKind"], "action");
-        assert_eq!(meta["geminiAcp"]["ui"]["component"], "action");
-        assert_eq!(meta["geminiAcp"]["ui"]["action"], "follow_up");
-        assert_eq!(meta["geminiAcp"]["ui"]["query"], "cargo test");
-        assert_eq!(meta["geminiAcp"]["ui"]["singleUse"], true);
-        assert_eq!(meta["geminiAcp"]["ui"]["dispatch"]["method"], "session/prompt");
-        assert_eq!(meta["geminiAcp"]["ui"]["dispatch"]["prompt"], "cargo test");
+    fn keeps_followup_values_stable() {
+        assert_eq!(SELECT_VALUE, "__followup_select__");
+        assert_eq!(SKIP_VALUE, "__followup_skip__");
     }
 
     #[test]
