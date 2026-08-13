@@ -16,7 +16,7 @@
 pub mod builtin;
 pub mod elicitation;
 pub mod executor;
-mod interactive_v2;
+pub mod interactive_v2;
 pub use interactive_v2 as interactive;
 pub mod lifecycle;
 pub mod parse;
