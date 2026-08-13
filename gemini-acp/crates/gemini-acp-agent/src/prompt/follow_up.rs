@@ -15,9 +15,7 @@ impl StreamNormalizer {
         self.drain(false)
     }
 
-    pub fn finish(&mut self) -> String {
-        self.drain(true)
-    }
+    pub fn finish(&mut self) -> String { self.drain(true) }
 
     fn drain(&mut self, final_flush: bool) -> String {
         let mut out = String::new();
@@ -44,20 +42,22 @@ impl StreamNormalizer {
 
             let Some(end) = self.pending.find("/>") else {
                 if final_flush {
-                    // A malformed/incomplete component should not disappear silently.
                     out.push_str(&self.pending);
                     self.pending.clear();
                 }
                 return out;
             };
 
-            // Complete FollowUp XML is consumed here. The raw assistant buffer
-            // remains available to `parse_tool_calls`, which turns it into the
-            // real builtin `FollowUp` ToolCall later in the turn.
+            // The raw assistant buffer remains untouched and is parsed later by
+            // `parse_tool_calls` into the actual FollowUp builtin ToolCall.
             self.pending = self.pending[end + 2..].to_owned();
         }
     }
 }
+
+/// Kept as a source-compatible helper for the existing turn orchestrator.
+/// FollowUp is no longer rendered here; the runtime parser owns that concern.
+pub fn replace_components(input: &str) -> String { input.to_owned() }
 
 fn partial_marker_len(input: &str) -> usize {
     let marker = b"<FollowUp";
@@ -91,10 +91,8 @@ mod tests {
     }
 
     #[test]
-    fn does_not_leak_partial_marker() {
-        let mut normalizer = StreamNormalizer::default();
-        assert_eq!(normalizer.push("hello <Follo"), "hello ");
-        assert_eq!(normalizer.push("wUp"), "");
-        assert_eq!(normalizer.finish(), "<FollowUp");
+    fn compatibility_replace_is_noop() {
+        let input = "text <FollowUp label=\"Run\" query=\"cargo test\" />";
+        assert_eq!(replace_components(input), input);
     }
 }
